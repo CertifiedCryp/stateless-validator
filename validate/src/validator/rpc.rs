@@ -6,19 +6,19 @@
 //!
 //! The `get_blob_ids` function acts as an RPC endpoint handler, allowing clients to query
 //! the validation status and retrieve blob information for a given block.
-use crate::file::{load_validate_info, ValidateStatus};
+use crate::file::{ValidateStatus, load_validate_info};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockTransactionsKind};
 use alloy_transport_http::{Client, Http};
-use eyre::{anyhow, Result};
+use eyre::{Result, anyhow};
 use futures::future::try_join_all;
 use jsonrpsee_types::error::{
-    ErrorObject, ErrorObjectOwned, CALL_EXECUTION_FAILED_CODE, INVALID_PARAMS_CODE,
+    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
     UNKNOWN_ERROR_CODE,
 };
 //use reth_primitives::{Address, BlockNumberOrTag, Bytes, B256};
-use alloy_primitives::{Address, Bytes, B256};
-use revm::primitives::{BlockNumberOrTag};
+use alloy_primitives::{Address, B256, Bytes};
+use revm::primitives::BlockNumberOrTag;
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 /// An RPC client for fetching data from a full Ethereum node.
@@ -31,8 +31,10 @@ pub struct RpcClient {
 impl RpcClient {
     /// Creates a new `RpcClient` connected to the given API endpoint.
     pub fn new(api: &str) -> Result<Self> {
-        let provider = ProviderBuilder::new()
-            .on_http(api.parse().map_err(|e| anyhow!("parse api failed: {}", e))?);
+        let provider = ProviderBuilder::new().on_http(
+            api.parse()
+                .map_err(|e| anyhow!("parse api failed: {}", e))?,
+        );
 
         Ok(Self { provider })
     }
@@ -98,8 +100,11 @@ impl RpcClient {
 
     /// Fetches a full block by its hash.
     pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block> {
-        let kind =
-            if full_txs { BlockTransactionsKind::Full } else { BlockTransactionsKind::Hashes };
+        let kind = if full_txs {
+            BlockTransactionsKind::Full
+        } else {
+            BlockTransactionsKind::Hashes
+        };
 
         self.provider
             .get_block_by_hash(hash, kind)
@@ -195,7 +200,11 @@ pub fn get_blob_ids(
             ValidateStatus::Success => {
                 results.insert(
                     block,
-                    validation.blob_ids.into_iter().map(|id| B256::from(id)).collect(),
+                    validation
+                        .blob_ids
+                        .into_iter()
+                        .map(|id| B256::from(id))
+                        .collect(),
                 );
             }
         }

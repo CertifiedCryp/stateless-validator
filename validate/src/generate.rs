@@ -3,12 +3,7 @@
 use crate::*;
 use alloy_primitives::{BlockHash, BlockNumber};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::OpenOptions,
-    io::Read,
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::{fs::OpenOptions, io::Read, path::PathBuf, time::SystemTime};
 
 /// Block witness Processing state
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -54,7 +49,9 @@ pub fn get_witness_state(
     path: &PathBuf,
     block: &(BlockNumber, BlockHash),
 ) -> std::io::Result<WitnessStatus> {
-    let path = path.join("witness").join(witness_file_name(block.0, block.1));
+    let path = path
+        .join("witness")
+        .join(witness_file_name(block.0, block.1));
     if !path.exists() {
         return Ok(WitnessStatus {
             status: SaltWitnessState::Idle,
@@ -70,14 +67,20 @@ pub fn get_witness_state(
     let mut contents = vec![];
     file.read_to_end(&mut contents)?;
     let state_data = deserialized_state_data(contents).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("block({:?}): {}", block, e))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("block({:?}): {}", block, e),
+        )
     })?;
     let deserialized =
         bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy()).map_err(
             |e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("block({:?}): Failed to deserialize  WitnessStatus: {}", block, e),
+                    format!(
+                        "block({:?}): Failed to deserialize  WitnessStatus: {}",
+                        block, e
+                    ),
                 )
             },
         )?;

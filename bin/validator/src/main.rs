@@ -1,26 +1,12 @@
 use clap::Parser;
-use eyre::{anyhow, Result};
+use eyre::{Result, anyhow};
 use futures::stream::{self, StreamExt};
-use jsonrpsee::{server::Server, RpcModule};
-use salt::{BlockWitness, EphemeralSaltState, StateRoot};
-use validate::{
-    generate::{curent_time_to_u64, get_witness_state},
-    produce::get_chain_status,
-    validator::{
-        evm::replay_block,
-        file::{
-            append_json_line_to_file, load_contracts_file, load_validate_info,
-            read_block_hash_by_number_from_file, set_validate_status, ValidateStatus,
-        },
-        rpc::{get_blob_ids, RpcClient},
-        PlainKeyUpdate, WitnessProvider,
-    },
-    SaltWitnessState,
-};
+use jsonrpsee::{RpcModule, server::Server};
 use revm::{
     db::in_memory_db::CacheDB,
-    primitives::{Bytecode, B256},
+    primitives::{B256, Bytecode},
 };
+use salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -29,6 +15,20 @@ use std::{
 };
 use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
+use validate::{
+    SaltWitnessState,
+    generate::{curent_time_to_u64, get_witness_state},
+    produce::get_chain_status,
+    validator::{
+        PlainKeyUpdate, WitnessProvider,
+        evm::replay_block,
+        file::{
+            ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
+            read_block_hash_by_number_from_file, set_validate_status,
+        },
+        rpc::{RpcClient, get_blob_ids},
+    },
+};
 
 /// Command line arguments for the `rerun_block` executable.
 #[derive(Parser, Debug)]
@@ -68,8 +68,11 @@ async fn main() -> Result<()> {
     info!("Server port: {:?}", args.port);
 
     // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs.
-    let concurrent_num =
-        if args.port.is_some() { (num_cpus::get() - 2).max(1) } else { num_cpus::get() };
+    let concurrent_num = if args.port.is_some() {
+        (num_cpus::get() - 2).max(1)
+    } else {
+        num_cpus::get()
+    };
     info!("Number of concurrent tasks: {}", concurrent_num);
 
     let stateless_dir = PathBuf::from(args.datadir);
@@ -207,8 +210,8 @@ async fn validate_block(
         };
         for block_hash in block_hashes {
             let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
-            if witness_status.status == SaltWitnessState::Idle ||
-                witness_status.status == SaltWitnessState::Processing
+            if witness_status.status == SaltWitnessState::Idle
+                || witness_status.status == SaltWitnessState::Processing
             {
                 // Wait for the witness to be completed.
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -227,10 +230,13 @@ async fn validate_block(
                     block_counter, validate_info.status
                 );
                 return Ok(());
-            } else if validate_info.status == ValidateStatus::Processing &&
-                validate_info.lock_time >= curent_time_to_u64()
+            } else if validate_info.status == ValidateStatus::Processing
+                && validate_info.lock_time >= curent_time_to_u64()
             {
-                info!("Block {} is currently being processed by another validator.", block_counter);
+                info!(
+                    "Block {} is currently being processed by another validator.",
+                    block_counter
+                );
                 return Ok(());
             } else if validate_info.status == ValidateStatus::Failed {
                 info!("Block {} validation failed, replay again...", block_counter);
@@ -292,7 +298,9 @@ async fn validate_block(
                 })
                 .collect::<Vec<_>>();
 
-            let codes = client.codes_at(&new_contracts_address, (block_counter - 1).into()).await?;
+            let codes = client
+                .codes_at(&new_contracts_address, (block_counter - 1).into())
+                .await?;
 
             let mut new_contracts = HashMap::new();
             for bytes in &codes {
@@ -333,9 +341,9 @@ async fn validate_block(
 
             if new_trie_root != new_state_root {
                 error!(
-                "Validation FAILED for block {}. Calculated state root: {:?}, Expected state root: {:?}",
-                block_counter, new_trie_root, new_state_root
-            );
+                    "Validation FAILED for block {}. Calculated state root: {:?}, Expected state root: {:?}",
+                    block_counter, new_trie_root, new_state_root
+                );
                 set_validate_status(
                     stateless_dir,
                     block_counter,

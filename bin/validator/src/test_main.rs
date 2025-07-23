@@ -2,20 +2,20 @@ use alloy_primitives::{BlockHash, BlockNumber};
 use alloy_provider::RootProvider;
 use alloy_rpc_types_eth::Block;
 use alloy_transport_http::{Client, Http};
-use eyre::{anyhow, Result};
+use eyre::{Result, anyhow};
 use megaeth_salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use megaeth_salt_stateless::{
+    SaltWitnessState,
     generator::get_witness_state,
     validator::{
+        PlainKeyUpdate, WitnessProvider,
         evm::replay_block,
         file::{load_contracts_file, load_json_file, read_block_hash_by_number_from_file},
-        PlainKeyUpdate, WitnessProvider,
     },
-    SaltWitnessState,
 };
 use revm::{
     db::in_memory_db::CacheDB,
-    primitives::{Bytecode, B256},
+    primitives::{B256, Bytecode},
 };
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
@@ -49,8 +49,8 @@ fn test_scan_and_validate_block_witnesses(
         let witness_status = get_witness_state(&stateless_dir, &(block_counter, block_hash))?;
 
         // 如果 WitnessStatus 状态为 Idle 或 Processing，则说明 generator client 未完成生成 witness
-        if witness_status.status == SaltWitnessState::Idle ||
-            witness_status.status == SaltWitnessState::Processing
+        if witness_status.status == SaltWitnessState::Idle
+            || witness_status.status == SaltWitnessState::Processing
         {
             println!("invalid witness_status: {:?}", witness_status);
             continue;
@@ -67,11 +67,17 @@ fn test_scan_and_validate_block_witnesses(
         let block_path = stateless_dir.join("witness");
 
         // 从文件中读取区块数据，block_a 是前一个区块，block_b 是当前区块(要验证的区块)
-        let block_a: Block =
-            load_json_file(&block_path, &block_file_name(block_counter - 1, pre_block_hash))?;
+        let block_a: Block = load_json_file(
+            &block_path,
+            &block_file_name(block_counter - 1, pre_block_hash),
+        )?;
         let block_b: Block =
             load_json_file(&block_path, &block_file_name(block_counter, block_hash))?;
-        println!("block {}'s tx len: {}", block_counter, block_b.transactions.len());
+        println!(
+            "block {}'s tx len: {}",
+            block_counter,
+            block_b.transactions.len()
+        );
 
         // 从文件中读取合约的 bytecode。
         let contracts: HashMap<B256, Bytecode> =
@@ -88,8 +94,12 @@ fn test_scan_and_validate_block_witnesses(
         let rt = Handle::current();
         let provider =
             RootProvider::<Http<Client>>::new_http("http://localhost:9545".parse().unwrap());
-        let witness_provider =
-            WitnessProvider { witness: block_witness.clone(), contracts, provider, rt };
+        let witness_provider = WitnessProvider {
+            witness: block_witness.clone(),
+            contracts,
+            provider,
+            rt,
+        };
 
         let mut db = CacheDB::new(witness_provider);
 
@@ -102,8 +112,9 @@ fn test_scan_and_validate_block_witnesses(
         let plain_state: PlainKeyUpdate = db.accounts.into();
 
         // 更新 salt 状态，获取 root
-        let state_updates =
-            EphemeralSaltState::new(&block_witness).update(&plain_state.data).unwrap();
+        let state_updates = EphemeralSaltState::new(&block_witness)
+            .update(&plain_state.data)
+            .unwrap();
 
         let mut trie = StateRoot::new();
         let (new_trie_root, _trie_updates) = trie.update(&block_witness, &state_updates).unwrap();

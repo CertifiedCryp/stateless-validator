@@ -1,22 +1,22 @@
 //! This module provides functions for interacting with the EVM, specifically for replaying
 //! block transactions using REVM.
-use alloy_rpc_types_eth::{Block, BlockTransactions, Transaction};
-use eyre::{anyhow, Result};
-use reth_chainspec::ChainSpecBuilder;
 use alloy_chain::Chain;
+use alloy_rpc_types_eth::{Block, BlockTransactions, Transaction};
+use eyre::{Result, anyhow};
+use reth_chainspec::ChainSpecBuilder;
 use reth_evm::system_calls::apply_beacon_root_contract_call;
 use reth_evm_optimism::OptimismEvmConfig;
 use reth_primitives::{
-    transaction::FillTxEnv, Signature, Transaction as RethTransaction, TransactionSigned,
-    TxDeposit, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy, B256,
+    B256, Signature, Transaction as RethTransaction, TransactionSigned, TxDeposit, TxEip1559,
+    TxEip2930, TxEip4844, TxEip7702, TxLegacy, transaction::FillTxEnv,
 };
 use revm::{
+    Evm,
     db::CacheDB,
     primitives::{
         BlobExcessGasAndPrice, BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg,
         HandlerCfg, SpecId, TxEnv, TxKind, U256,
     },
-    Evm,
 };
 use std::str::FromStr;
 
@@ -43,7 +43,9 @@ use super::WitnessProvider;
 
 pub fn replay_block(block: Block, db: &mut CacheDB<WitnessProvider>) -> Result<()> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
-        return Err(anyhow!("Wrong transaction type, expected full transactions"));
+        return Err(anyhow!(
+            "Wrong transaction type, expected full transactions"
+        ));
     };
 
     let initialized_cfg = get_evm_config();
@@ -78,8 +80,9 @@ pub fn replay_block(block: Block, db: &mut CacheDB<WitnessProvider>) -> Result<(
         *evm.tx_mut() = get_tx_env(&tx)?;
 
         // Execute the transaction and commit its changes to the database.
-        let _result =
-            evm.transact_commit().map_err(|e| anyhow!("transact_commit failed: {:?}", e))?;
+        let _result = evm
+            .transact_commit()
+            .map_err(|e| anyhow!("transact_commit failed: {:?}", e))?;
     }
 
     Ok(())
@@ -106,16 +109,22 @@ fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
         Some(0) => RethTransaction::Legacy(TxLegacy {
             chain_id: tx.chain_id,
             nonce: tx.nonce,
-            gas_price: tx.gas_price.ok_or(anyhow!("gas_price is None in Legacy tx"))?,
+            gas_price: tx
+                .gas_price
+                .ok_or(anyhow!("gas_price is None in Legacy tx"))?,
             gas_limit: tx.gas as u64,
             to: TxKind::from(tx.to),
             value: tx.value,
             input: tx.input.clone(),
         }),
         Some(1) => RethTransaction::Eip2930(TxEip2930 {
-            chain_id: tx.chain_id.ok_or(anyhow!("chain_id is None in Eip2930 tx"))?,
+            chain_id: tx
+                .chain_id
+                .ok_or(anyhow!("chain_id is None in Eip2930 tx"))?,
             nonce: tx.nonce,
-            gas_price: tx.gas_price.ok_or(anyhow!("gas_price is None in Eip2930 tx"))?,
+            gas_price: tx
+                .gas_price
+                .ok_or(anyhow!("gas_price is None in Eip2930 tx"))?,
             gas_limit: tx.gas as u64,
             to: TxKind::from(tx.to),
             value: tx.value,
@@ -123,7 +132,9 @@ fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
             input: tx.input.clone(),
         }),
         Some(2) => RethTransaction::Eip1559(TxEip1559 {
-            chain_id: tx.chain_id.ok_or(anyhow!("chain_id is None in Eip1559 tx"))?,
+            chain_id: tx
+                .chain_id
+                .ok_or(anyhow!("chain_id is None in Eip1559 tx"))?,
             nonce: tx.nonce,
             gas_limit: tx.gas as u64,
             max_fee_per_gas: tx
@@ -139,7 +150,9 @@ fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
             input: tx.input.clone(),
         }),
         Some(3) => RethTransaction::Eip4844(TxEip4844 {
-            chain_id: tx.chain_id.ok_or(anyhow!("chain_id is None in Eip4844 tx"))?,
+            chain_id: tx
+                .chain_id
+                .ok_or(anyhow!("chain_id is None in Eip4844 tx"))?,
             nonce: tx.nonce,
             gas_limit: tx.gas as u64,
             max_fee_per_gas: tx
@@ -160,7 +173,9 @@ fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
             input: tx.input.clone(),
         }),
         Some(4) => RethTransaction::Eip7702(TxEip7702 {
-            chain_id: tx.chain_id.ok_or(anyhow!("chain_id is None in Eip7702 tx"))?,
+            chain_id: tx
+                .chain_id
+                .ok_or(anyhow!("chain_id is None in Eip7702 tx"))?,
             nonce: tx.nonce,
             gas_limit: tx.gas as u64,
             max_fee_per_gas: tx
@@ -219,7 +234,12 @@ fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
                 input: tx.input.clone(),
             })
         }
-        _ => return Err(anyhow!("Unsupported transaction type: {:?}", tx.transaction_type)),
+        _ => {
+            return Err(anyhow!(
+                "Unsupported transaction type: {:?}",
+                tx.transaction_type
+            ));
+        }
     };
 
     let signed_tx = TransactionSigned {

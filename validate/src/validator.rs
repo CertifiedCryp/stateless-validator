@@ -7,13 +7,12 @@
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_transport_http::{Client, Http};
-use salt::{BlockWitness, PlainStateProvider, PlainKey, PlainValue, Account};
-use mega_evm;
 use revm::{
-    db::DbAccount,
-    primitives::{AccountInfo, Bytecode, Bytes, KECCAK_EMPTY, U256},
     DatabaseRef,
+    database::DbAccount,
+    primitives::{AccountInfo, Bytecode, Bytes, KECCAK_EMPTY, U256},
 };
+use salt::{Account, BlockWitness, PlainKey, PlainStateProvider, PlainValue};
 use std::collections::HashMap;
 use tokio::{runtime::Handle, sync::oneshot};
 
@@ -46,20 +45,24 @@ impl DatabaseRef for WitnessProvider {
         let plain_state_provider = PlainStateProvider::new(&self.witness);
 
         let raw_key = PlainKey::Account(address).encode();
-        let account =  plain_state_provider.get_raw(&raw_key)?.map(|raw_value| {
+        let account = plain_state_provider.get_raw(&raw_key)?.map(|raw_value| {
             let (_, plain_value) = SaltValue::new(&raw_key, &raw_value).into();
             match plain_value {
                 PlainValue::Account(acc) => {
                     // If the account has bytecode, find it in the local `contracts` map.
-                    let code = acc.bytecode_hash.map(|hash| self.contracts.get(&hash)).flatten().cloned();
-                    
+                    let code = acc
+                        .bytecode_hash
+                        .map(|hash| self.contracts.get(&hash))
+                        .flatten()
+                        .cloned();
+
                     AccountInfo {
                         balance: acc.balance,
                         nonce: acc.nonce,
                         code_hash: acc.bytecode_hash.unwrap_or(KECCAK_EMPTY),
                         code,
                     }
-                },
+                }
                 _ => _,
             }
         });
@@ -84,7 +87,10 @@ impl DatabaseRef for WitnessProvider {
             return Ok(Bytecode::new_raw(Bytes::new()));
         }
         // The code is expected to be pre-loaded into the `contracts` map.
-        self.contracts.get(&code_hash).cloned().ok_or("Code not found in witness contracts")
+        self.contracts
+            .get(&code_hash)
+            .cloned()
+            .ok_or("Code not found in witness contracts")
     }
 
     /// Provides a storage slot's value for a given account.
@@ -111,8 +117,9 @@ impl DatabaseRef for WitnessProvider {
                 let _ = tx.send(provider.get_block_by_number(number.into(), false).await);
             });
 
-            let res =
-                rx.blocking_recv().map_err(|_| "Failed to receive block from spawned task")?;
+            let res = rx
+                .blocking_recv()
+                .map_err(|_| "Failed to receive block from spawned task")?;
 
             let block = res.map_err(|_| "Failed to get block from provider in witness provider")?;
 
@@ -141,8 +148,11 @@ impl From<HashMap<Address, DbAccount>> for PlainKeyUpdate {
             // Handle account updates.
             let account_key = PlainKey::Account(address).encode();
             let plain_account: Account = account.info.into();
-            let plain_val =
-                if plain_account.is_empty() { None } else { Some(plain_account.encode()) };
+            let plain_val = if plain_account.is_empty() {
+                None
+            } else {
+                Some(plain_account.encode())
+            };
 
             data.insert(account_key, plain_val);
 

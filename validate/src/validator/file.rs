@@ -1,15 +1,15 @@
 //! This module handles file-based operations for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
 use crate::{curent_time_to_u64, deserialized_state_data, serialized_state_data};
-use alloy_primitives::{BlockHash, BlockNumber, B256};
-use eyre::{anyhow, Result};
+use alloy_primitives::{B256, BlockHash, BlockNumber};
+use eyre::{Result, anyhow};
 use fs2::FileExt;
 use rand::Rng;
-use revm::primitives::Bytecode;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use revm::state::Bytecode;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
-    fs::{create_dir_all, read_dir, File, OpenOptions},
+    fs::{File, OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     str::FromStr,
@@ -54,7 +54,9 @@ pub fn load_validate_info(
     block_number: BlockNumber,
     block_hash: BlockHash,
 ) -> Result<ValidateInfo> {
-    let validate_path = path.join("validate").join(validate_file_name(block_number, block_hash));
+    let validate_path = path
+        .join("validate")
+        .join(validate_file_name(block_number, block_hash));
     let backup_path = path.join(crate::backup_file(block_number, ".v"));
     if !validate_path.exists() && !backup_path.exists() {
         return Ok(ValidateInfo::default());
@@ -73,13 +75,15 @@ pub fn load_validate_info(
     let state_data =
         deserialized_state_data(contents).map_err(|e| anyhow!("block({block_number}): {}", e))?;
 
-    let (validation, _): (ValidateInfo, usize) = bincode::serde::decode_from_slice(
-        &state_data.data,
-        bincode::config::legacy(),
-    )
-    .map_err(|e| {
-        anyhow!("block({block_number}, {block_hash}): Failed to deserialize validate info: {}", e)
-    })?;
+    let (validation, _): (ValidateInfo, usize) =
+        bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy()).map_err(
+            |e| {
+                anyhow!(
+                    "block({block_number}, {block_hash}): Failed to deserialize validate info: {}",
+                    e
+                )
+            },
+        )?;
     if validation.block_hash == block_hash {
         Ok(validation)
     } else {
@@ -93,7 +97,9 @@ pub fn remove_block_validate(
     block: (BlockNumber, BlockHash),
 ) -> std::io::Result<bool> {
     let mut remove = false;
-    let path = path.join("validate").join(validate_file_name(block.0, block.1));
+    let path = path
+        .join("validate")
+        .join(validate_file_name(block.0, block.1));
     if path.exists() {
         remove = true;
         std::fs::remove_file(path)?;
@@ -107,7 +113,9 @@ pub fn backup_block_validate(
     block: (BlockNumber, BlockHash),
 ) -> std::io::Result<bool> {
     let mut backup = false;
-    let validate_path = path.join("validate").join(validate_file_name(block.0, block.1));
+    let validate_path = path
+        .join("validate")
+        .join(validate_file_name(block.0, block.1));
     let backup_path = path.join(crate::backup_file(block.0, ".v"));
     if validate_path.exists() && !backup_path.exists() {
         backup = true;
@@ -208,9 +216,17 @@ pub fn store_json_file<T: Serialize>(data: T, data_dir: &PathBuf, file_name: &st
     if json_file.exists() {
         return Ok(());
     }
-    let mut json_fp = File::options().write(true).create(true).open(&json_file).map_err(|e| {
-        anyhow!("Failed to open or create file for writing {}: {}", json_file.display(), e)
-    })?;
+    let mut json_fp = File::options()
+        .write(true)
+        .create(true)
+        .open(&json_file)
+        .map_err(|e| {
+            anyhow!(
+                "Failed to open or create file for writing {}: {}",
+                json_file.display(),
+                e
+            )
+        })?;
 
     let json_bytes = simd_json::to_vec(&data)
         .map_err(|e| anyhow!("Failed to serialize data in {}: {}", json_file.display(), e))?;
@@ -249,7 +265,10 @@ fn save_validate_info(
 
     // 1. Write to a temporary file. This operation is not atomic.
     {
-        let mut tmp_file = OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
         FileExt::lock_exclusive(&tmp_file)?;
         tmp_file.write_all(&serialized)?;
         tmp_file.sync_all()?;
@@ -286,8 +305,8 @@ pub fn read_block_hash_by_number_from_file(
         if path.is_file() {
             if let Some(file_name_os_str) = path.file_name() {
                 if let Some(file_name_str) = file_name_os_str.to_str() {
-                    if file_name_str.starts_with(&file_prefix) &&
-                        file_name_str.ends_with(FILE_SUFFIX)
+                    if file_name_str.starts_with(&file_prefix)
+                        && file_name_str.ends_with(FILE_SUFFIX)
                     {
                         let hash_part = &file_name_str
                             [file_prefix.len()..(file_name_str.len() - FILE_SUFFIX.len())];
@@ -373,9 +392,17 @@ pub fn append_json_line_to_file<T: Serialize>(
 
     let json_file = data_dir.join(file_name);
 
-    let mut file = OpenOptions::new().append(true).create(true).open(&json_file).map_err(|e| {
-        anyhow!("Failed to open or create file for appending {}: {}", json_file.display(), e)
-    })?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&json_file)
+        .map_err(|e| {
+            anyhow!(
+                "Failed to open or create file for appending {}: {}",
+                json_file.display(),
+                e
+            )
+        })?;
 
     let json_bytes = simd_json::to_vec(data)
         .map_err(|e| anyhow!("Failed to serialize data in {}: {}", json_file.display(), e))?;

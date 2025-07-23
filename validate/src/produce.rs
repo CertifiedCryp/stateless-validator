@@ -1,13 +1,13 @@
 //! this module provides the functionality to save and retrieve block state deltas
 // and chain status for the Salt blockchain.
 
+use alloy_primitives::{BlockHash, BlockNumber};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::OpenOptions,
     io::{Read, Result},
     path::PathBuf,
 };
-use alloy_primitives::{BlockHash, BlockNumber};
-use serde::{Serialize,Deserialize};
 
 /// the chain status, which contains the finalized block number, block hash
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

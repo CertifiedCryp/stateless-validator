@@ -7,7 +7,7 @@ pub use generate::*;
 pub mod validator;
 pub use validator::*;
 
-use alloy_primitives::{hex, BlockHash, BlockNumber, B256};
+use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use serde::{Deserialize, Serialize};
 
 /// The number of blocks to shift for backup file naming
@@ -52,7 +52,10 @@ pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
     hasher.update(&state_data.data);
     let hash = B256::from_slice(hasher.finalize().as_bytes());
     if state_data.hash != hash {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Hash mismatch"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Hash mismatch",
+        ));
     }
 
     Ok(state_data)
@@ -60,7 +63,11 @@ pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
 
 /// Get the block number from the file name
 pub fn file_name_number(file_name: &str) -> BlockNumber {
-    file_name.split('.').nth(0).and_then(|s| s.parse::<BlockNumber>().ok()).unwrap_or_default()
+    file_name
+        .split('.')
+        .nth(0)
+        .and_then(|s| s.parse::<BlockNumber>().ok())
+        .unwrap_or_default()
 }
 
 /// Get the block hash from the file name
