@@ -10,7 +10,8 @@ use alloy_transport_http::{Client, Http};
 use revm::{
     DatabaseRef,
     database::DbAccount,
-    primitives::{AccountInfo, Bytecode, Bytes, KECCAK_EMPTY, U256},
+    primitives::{Bytes, KECCAK_EMPTY, U256},
+    state::{AccountInfo, Bytecode},
 };
 use salt::{Account, BlockWitness, PlainKey, PlainStateProvider, PlainValue};
 use std::collections::HashMap;
@@ -45,9 +46,8 @@ impl DatabaseRef for WitnessProvider {
         let plain_state_provider = PlainStateProvider::new(&self.witness);
 
         let raw_key = PlainKey::Account(address).encode();
-        let account = plain_state_provider.get_raw(&raw_key)?.map(|raw_value| {
-            let (_, plain_value) = SaltValue::new(&raw_key, &raw_value).into();
-            match plain_value {
+        let account = if let Some(raw_value) = plain_state_provider.get_raw(&raw_key)? {
+            match PlainValue::decode(&raw_value) {
                 PlainValue::Account(acc) => {
                     // If the account has bytecode, find it in the local `contracts` map.
                     let code = acc
@@ -56,28 +56,18 @@ impl DatabaseRef for WitnessProvider {
                         .flatten()
                         .cloned();
 
-                    AccountInfo {
+                    Some(AccountInfo {
                         balance: acc.balance,
                         nonce: acc.nonce,
                         code_hash: acc.bytecode_hash.unwrap_or(KECCAK_EMPTY),
                         code,
-                    }
+                    })
                 }
-                _ => _,
+                _ => None,
             }
-        });
-
-        /*let account = plain_state_provider.get_account(address)?.map(|acc| {
-            // If the account has bytecode, find it in the local `contracts` map.
-            let code = acc.bytecode_hash.map(|hash| self.contracts.get(&hash)).flatten().cloned();
-
-            AccountInfo {
-                balance: acc.balance,
-                nonce: acc.nonce,
-                code_hash: acc.bytecode_hash.unwrap_or(KECCAK_EMPTY),
-                code,
-            }
-        });*/
+        } else {
+            None
+        };
         Ok(account)
     }
 
@@ -100,8 +90,16 @@ impl DatabaseRef for WitnessProvider {
         index: U256,
     ) -> Result<U256, <Self as DatabaseRef>::Error> {
         let plain_state_provider = PlainStateProvider::new(&self.witness);
-        let storage = plain_state_provider.get_storage(address, index.into())?;
-        Ok(storage.unwrap_or_default())
+        let raw_key = PlainKey::Storage(address, index.into()).encode();
+        let storage = if let Some(raw_value) = plain_state_provider.get_raw(&raw_key)? {
+            match PlainValue::decode(&raw_value) {
+                PlainValue::Storage(storage) => storage,
+                _ => U256::default(),
+            }
+        } else {
+            U256::default()
+        };
+        Ok(storage)
     }
 
     /// Provides a historical block hash.
@@ -147,21 +145,34 @@ impl From<HashMap<Address, DbAccount>> for PlainKeyUpdate {
         for (address, account) in accounts {
             // Handle account updates.
             let account_key = PlainKey::Account(address).encode();
-            let plain_account: Account = account.info.into();
+            let plain_account = Account {
+                nonce: account.info.nonce,
+                balance: account.info.balance,
+                bytecode_hash: if account.info.code_hash == KECCAK_EMPTY {
+                    None
+                } else {
+                    Some(account.info.code_hash)
+                },
+            };
             let plain_val = if plain_account.is_empty() {
                 None
             } else {
-                Some(plain_account.encode())
+                Some(PlainValue::Account(plain_account).encode())
             };
 
             data.insert(account_key, plain_val);
 
             // Handle storage updates for the account.
             for (slot, value) in account.storage {
+                // A value of zero in storage is equivalent to non-existence.
+                let storage_value = if value.is_zero() {
+                    None
+                } else {
+                    Some(PlainValue::Storage(value.into()).encode())
+                };
                 data.insert(
                     PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode(),
-                    // A value of zero in storage is equivalent to non-existence.
-                    Some(value).filter(|v| !v.is_zero()).map(Into::into),
+                    storage_value,
                 );
             }
         }

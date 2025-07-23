@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 salt = { workspace = true }
 mega-evm = { workspace = true }
-revm = { workspace = true }
+revm = { workspace = true, features = ["serde"] }
 alloy-primitives = { version = "0.8.20", default-features = false }
 blake3 = "1.8"
 bytes = "1.5"
