@@ -1,0 +1,388 @@
+use clap::Parser;
+use eyre::{anyhow, Result};
+use futures::stream::{self, StreamExt};
+use jsonrpsee::{server::Server, RpcModule};
+use salt::{BlockWitness, EphemeralSaltState, StateRoot};
+use validate::{
+    generate::{curent_time_to_u64, get_witness_state},
+    produce::get_chain_status,
+    validator::{
+        evm::replay_block,
+        file::{
+            append_json_line_to_file, load_contracts_file, load_validate_info,
+            read_block_hash_by_number_from_file, set_validate_status, ValidateStatus,
+        },
+        rpc::{get_blob_ids, RpcClient},
+        PlainKeyUpdate, WitnessProvider,
+    },
+    SaltWitnessState,
+};
+use revm::{
+    db::in_memory_db::CacheDB,
+    primitives::{Bytecode, B256},
+};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{runtime::Handle, signal, sync::Mutex};
+use tracing::{error, info};
+
+/// Command line arguments for the `rerun_block` executable.
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// The starting block number from which to begin replaying.
+    #[clap(short, long)]
+    datadir: String,
+
+    /// The total number of consecutive blocks to replay.
+    #[clap(short, long, default_value_t = 5)]
+    lock_time: u64,
+
+    /// The URL of the Ethereum JSON-RPC API endpoint to use for fetching block data.
+    #[clap(short, long)]
+    api: String,
+
+    /// The port of the stateless validator server.
+    #[clap(short, long)]
+    port: Option<u16>,
+}
+
+/// The main entry point for the stateless validator.
+///
+/// This executable is responsible for scanning for new block witnesses, validating them by
+/// replaying the block, and verifying the resulting state root. It can run in a standalone mode or
+/// expose an RPC server for querying validation status.
+#[tokio::main]
+async fn main() -> Result<()> {
+    //RethTracer::new().init()?;
+    let start = Instant::now();
+    let args = Args::parse();
+
+    info!("Data directory: {}", args.datadir);
+    info!("Lock time: {} seconds", args.lock_time);
+    info!("API endpoint: {}", args.api);
+    info!("Server port: {:?}", args.port);
+
+    // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs.
+    let concurrent_num =
+        if args.port.is_some() { (num_cpus::get() - 2).max(1) } else { num_cpus::get() };
+    info!("Number of concurrent tasks: {}", concurrent_num);
+
+    let stateless_dir = PathBuf::from(args.datadir);
+
+    let client = Arc::new(RpcClient::new(&args.api)?);
+
+    // fetch the latest finalized block number.
+    let chain_status = get_chain_status(&stateless_dir)?;
+    let finalized_num = chain_status.block_number;
+
+    // Start validating from the block after the last finalized one.
+    // Note: Block 1 cannot be replayed currently, this needs further investigation.
+    let block_counter = finalized_num + 1;
+    let validator_logic = scan_and_validate_block_witnesses(
+        client,
+        &stateless_dir,
+        block_counter,
+        args.lock_time,
+        concurrent_num,
+    );
+
+    if let Some(port) = args.port {
+        let mut module = RpcModule::new(stateless_dir.clone());
+
+        module.register_method("stateless_getValidation", |params, path, _| {
+            let blocks: Vec<String> = params.parse()?;
+            get_blob_ids(path, blocks)
+        })?;
+
+        let server = Server::builder().build(format!("0.0.0.0:{}", port)).await?;
+        let addr = server.local_addr()?.to_string();
+        info!("Server listening on {}", addr);
+
+        let handle = server.start(module);
+
+        tokio::select! {
+            res = validator_logic => res?,
+            _ = handle.stopped() => {
+                info!("Server has stopped.");
+            },
+            _ = signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down.");
+            }
+        }
+    } else {
+        info!("Server not configured to start. Running validation logic only.");
+        tokio::select! {
+            res = validator_logic => res?,
+            _ = signal::ctrl_c() => {
+                info!("Ctrl-C received, shutting down.");
+            }
+        }
+    }
+
+    info!("Total execution time: {:?}", start.elapsed());
+    Ok(())
+}
+
+/// Scans for and validates block witnesses concurrently.
+///
+/// This function creates a stream of block numbers starting from `block_counter` and processes them
+/// concurrently.
+async fn scan_and_validate_block_witnesses(
+    client: Arc<RpcClient>,
+    stateless_dir: &PathBuf,
+    block_counter: u64,
+    lock_time: u64,
+    concurrent_num: usize,
+) -> Result<()> {
+    let validate_path = stateless_dir.join("validate");
+    let contracts_file = "contracts.txt";
+
+    // Load already known contracts from a file to avoid re-fetching them.
+    let contracts = Arc::new(Mutex::new(
+        load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
+    ));
+
+    let stateless_dir = stateless_dir.to_path_buf();
+
+    // Create an infinite stream of block numbers to process.
+    stream::iter(block_counter..)
+        .for_each_concurrent(Some(concurrent_num), |block_counter| {
+            let client = Arc::clone(&client);
+            let stateless_dir = stateless_dir.clone();
+            let contracts = Arc::clone(&contracts);
+
+            async move {
+                if let Err(e) =
+                    validate_block(client, &stateless_dir, block_counter, lock_time, contracts)
+                        .await
+                {
+                    error!("Failed to validate block {}: {:?}", block_counter, e);
+                }
+            }
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Performs the validation for a single block.
+///
+/// This function handles the entire lifecycle of validating a block:
+/// 1. Waits for the block's witness to become available.
+/// 2. Checks if the block needs validation and locks it.
+/// 3. Fetches block data and decodes the witness.
+/// 4. Verifies the witness proof.
+/// 5. Fetches any new contract bytecodes.
+/// 6. Replays the block transactions using an in-memory DB with the witness provider.
+/// 7. Computes the new state root and compares it with the one in the block header.
+/// 8. Updates the validation status of the block.
+async fn validate_block(
+    client: Arc<RpcClient>,
+    stateless_dir: &PathBuf,
+    block_counter: u64,
+    lock_time: u64,
+    contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
+) -> Result<()> {
+    let validate_path = stateless_dir.join("validate");
+    let contracts_file = "contracts.txt";
+
+    info!("Processing block: {}", block_counter);
+
+    let mut loops = true;
+
+    // This loop waits for the witness for the block to be generated and available.
+    while loops {
+        let block_hashes = match read_block_hash_by_number_from_file(block_counter, stateless_dir) {
+            Ok(hashes) => hashes,
+            Err(_e) => {
+                // Witness for block_counter not found, waiting...
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        for block_hash in block_hashes {
+            let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
+            if witness_status.status == SaltWitnessState::Idle ||
+                witness_status.status == SaltWitnessState::Processing
+            {
+                // Wait for the witness to be completed.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                // start with while loop to handle this block hash again
+                break;
+            }
+
+            let witness_bytes = witness_status.witness_data;
+
+            let validate_info = load_validate_info(stateless_dir, block_counter, block_hash)?;
+            // Check if the block has already been validated or is being processed by another
+            // validator.
+            if validate_info.status == ValidateStatus::Success {
+                info!(
+                    "Block {} has already been validated with result: {:?}",
+                    block_counter, validate_info.status
+                );
+                return Ok(());
+            } else if validate_info.status == ValidateStatus::Processing &&
+                validate_info.lock_time >= curent_time_to_u64()
+            {
+                info!("Block {} is currently being processed by another validator.", block_counter);
+                return Ok(());
+            } else if validate_info.status == ValidateStatus::Failed {
+                info!("Block {} validation failed, replay again...", block_counter);
+                // start with while loop to handle this block hash again
+                break;
+            }
+            // Lock the block for processing to prevent other validators from working on it.
+            set_validate_status(
+                stateless_dir,
+                block_counter,
+                block_hash,
+                ValidateStatus::Processing,
+                None,
+                Some(lock_time),
+                Some(witness_status.blob_ids.clone()),
+            )?;
+
+            // Fetch the full block details and decode the witness concurrently.
+            let (blocks_result, witness_decode_result) = {
+                let witness_bytes_clone = witness_bytes.clone();
+                tokio::join!(
+                    client.block_by_hash(block_hash, true),
+                    tokio::task::spawn_blocking(move || {
+                        bincode::serde::decode_from_slice(
+                            &witness_bytes_clone,
+                            bincode::config::legacy(),
+                        )
+                        .map_err(|e| anyhow!("Failed to parse witness: {}", e))
+                    })
+                )
+            };
+
+            let block = blocks_result?;
+            let (block_witness, _size): (BlockWitness, usize) = witness_decode_result??;
+
+            let old_state_root = get_root(
+                client.as_ref(),
+                stateless_dir,
+                block_counter - 1,
+                block.header.parent_hash,
+            )
+            .await?;
+            let new_state_root = block.header.state_root;
+
+            block_witness.verify_proof::<BlockWitness, BlockWitness>(old_state_root)?;
+
+            let code_hash_not_empty_addresses = block_witness.get_code_hash_not_empty_addresses();
+
+            let mut contracts_guard = contracts.lock().await;
+
+            let new_contracts_address = code_hash_not_empty_addresses
+                .iter()
+                .filter_map(|(address, code_hash)| {
+                    if !contracts_guard.contains_key(code_hash) {
+                        Some(*address)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let codes = client.codes_at(&new_contracts_address, (block_counter - 1).into()).await?;
+
+            let mut new_contracts = HashMap::new();
+            for bytes in &codes {
+                let bytecode = Bytecode::new_raw(bytes.clone());
+                new_contracts.insert(bytecode.hash_slow(), bytecode.clone());
+            }
+
+            contracts_guard.extend(new_contracts.clone());
+            let contracts_for_provider = contracts_guard.clone();
+            drop(contracts_guard);
+
+            // Persist new contracts to the file.
+            for (hash, bytecode) in new_contracts {
+                append_json_line_to_file(&(hash, bytecode), &validate_path, contracts_file)?;
+            }
+
+            let rt = Handle::current();
+            let witness_provider = WitnessProvider {
+                witness: block_witness.clone(),
+                contracts: contracts_for_provider,
+                provider: client.provider.clone(),
+                rt,
+            };
+            let mut db = CacheDB::new(witness_provider);
+
+            replay_block(block.clone(), &mut db)?;
+
+            let plain_state: PlainKeyUpdate = db.accounts.into();
+
+            let state_updates = EphemeralSaltState::new(&block_witness)
+                .update(&plain_state.data)
+                .map_err(|e| anyhow!("Failed to update state: {}", e))?;
+
+            let mut trie = StateRoot::new();
+            let (new_trie_root, _trie_updates) = trie
+                .update(&block_witness, &state_updates)
+                .map_err(|e| anyhow!("Failed to update trie: {}", e))?;
+
+            if new_trie_root != new_state_root {
+                error!(
+                "Validation FAILED for block {}. Calculated state root: {:?}, Expected state root: {:?}",
+                block_counter, new_trie_root, new_state_root
+            );
+                set_validate_status(
+                    stateless_dir,
+                    block_counter,
+                    block_hash,
+                    ValidateStatus::Failed,
+                    Some(new_state_root),
+                    None,
+                    None,
+                )?;
+            } else {
+                info!(
+                    "Validation SUCCESS for block {}. State root: {:?}",
+                    block_counter, new_trie_root
+                );
+                set_validate_status(
+                    stateless_dir,
+                    block_counter,
+                    block_hash,
+                    ValidateStatus::Success,
+                    Some(new_state_root),
+                    None,
+                    None,
+                )?;
+                loops = false;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Retrieves the state root for a given block number.
+///
+/// It first attempts to find the state root from the local validation files. If not found, it
+/// falls back to fetching the block from the RPC endpoint.
+async fn get_root(
+    client: &RpcClient,
+    stateless_dir: &PathBuf,
+    block_number: u64,
+    block_hash: B256,
+) -> Result<B256> {
+    let validate_info = load_validate_info(stateless_dir, block_number, block_hash)?;
+    if validate_info.state_root.is_zero() {
+        // If state root is not in our validation records, fetch from RPC.
+        let block = client.block_by_number(block_number, false).await?;
+        return Ok(block.header.state_root);
+    }
+
+    Ok(validate_info.state_root)
+}
