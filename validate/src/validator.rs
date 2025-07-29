@@ -4,6 +4,7 @@
 //! This allows it to act as a read-only database for REVM, but instead of fetching data from a
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
+use crate::formate::{Account, PlainKey, PlainValue};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use revm::{
@@ -13,7 +14,7 @@ use revm::{
     primitives::{Bytes, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
-use salt::{Account, BlockWitness, PlainKey, PlainStateProvider, PlainValue};
+use salt::{BlockWitness, PlainStateProvider};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
