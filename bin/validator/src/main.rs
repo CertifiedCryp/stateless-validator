@@ -59,7 +59,7 @@ struct Args {
 /// expose an RPC server for querying validation status.
 #[tokio::main]
 async fn main() -> Result<()> {
-    //RethTracer::new().init()?;
+    tracing_subscriber::fmt::init();
     let start = Instant::now();
     let args = Args::parse();
 
