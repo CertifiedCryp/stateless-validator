@@ -67,7 +67,7 @@ pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
 pub fn file_name_number(file_name: &str) -> BlockNumber {
     file_name
         .split('.')
-        .nth(0)
+        .next()
         .and_then(|s| s.parse::<BlockNumber>().ok())
         .unwrap_or_default()
 }

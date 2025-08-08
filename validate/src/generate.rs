@@ -3,7 +3,7 @@
 use crate::*;
 use alloy_primitives::{BlockHash, BlockNumber};
 use serde::{Deserialize, Serialize};
-use std::{fs::OpenOptions, io::Read, path::PathBuf, time::SystemTime};
+use std::{fs::OpenOptions, io::Read, path::Path, time::SystemTime};
 
 /// Block witness Processing state
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ pub struct WitnessStatus {
 
 /// get block witness status by given blocknum and blockhash
 pub fn get_witness_state(
-    path: &PathBuf,
+    path: &Path,
     block: &(BlockNumber, BlockHash),
 ) -> std::io::Result<WitnessStatus> {
     let path = path

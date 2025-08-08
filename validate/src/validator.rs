@@ -78,8 +78,7 @@ impl DatabaseRef for WitnessProvider {
                     // If the account has bytecode, find it in the local `contracts` map.
                     let code = acc
                         .bytecode_hash
-                        .map(|hash| self.contracts.get(&hash))
-                        .flatten()
+                        .and_then(|hash| self.contracts.get(&hash))
                         .cloned();
 
                     Some(AccountInfo {
@@ -173,7 +172,7 @@ impl From<HashMap<Address, CacheAccount>> for PlainKeyUpdate {
             let account_key = PlainKey::Account(address).encode();
 
             let (info, _) = account.into_components();
-            if info == None {
+            if info.is_none() {
                 continue;
             } else {
                 let (info, storage) = info.unwrap();
@@ -200,7 +199,7 @@ impl From<HashMap<Address, CacheAccount>> for PlainKeyUpdate {
                     let storage_value = if value.is_zero() {
                         None
                     } else {
-                        Some(PlainValue::Storage(value.into()).encode())
+                        Some(PlainValue::Storage(value).encode())
                     };
 
                     data.insert(

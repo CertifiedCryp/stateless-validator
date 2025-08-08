@@ -1,8 +1,11 @@
+//! ref
+//! https://github.com/megaeth-labs/mega-reth/blob/refactor/base-on-v1.3.4/crates/optimism/primitives/src/receipt.rs
+
 use alloy_consensus::{Eip658Value, Receipt, TxReceipt};
 use alloy_primitives::{Bloom, Log};
 use op_alloy_consensus::OpDepositReceipt;
 
-/// Typed ethereum transaction receipt.
+/// Typed optimism-type transaction receipt.
 /// Receipt containing result of transaction execution.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OpReceipt {

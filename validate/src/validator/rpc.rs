@@ -9,8 +9,7 @@
 use crate::file::{ValidateStatus, load_validate_info};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use alloy_rpc_types_eth::Block;
-use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Result, eyre};
 use futures::future::try_join_all;
 use jsonrpsee_types::error::{
@@ -20,7 +19,7 @@ use jsonrpsee_types::error::{
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 //use reth_primitives::{Address, BlockNumberOrTag, Bytes, B256};
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, path::Path, str::FromStr};
 
 /// An RPC client for fetching data from a full Ethereum node.
 #[derive(Debug, Clone)]
@@ -92,7 +91,7 @@ impl RpcClient {
                 block_options_vec
                     .into_iter()
                     .map(|opt_block| {
-                        opt_block.and_then(|block| Some(block.header.hash)).ok_or_else(|| {
+                        opt_block.map(|block| block.header.hash).ok_or_else(|| {
                             eyre!(
                                 "A requested block was not found by the provider or its header is missing"
                             )
@@ -106,38 +105,29 @@ impl RpcClient {
 
     /// Fetches a full block by its hash.
     pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block<Transaction>> {
-        if full_txs {
-            self.provider
-                .get_block(hash.into())
-                .full()
-                .await
-                .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))?
-                .ok_or(eyre!("block not found"))
-        } else {
-            self.provider
-                .get_block(hash.into())
-                .await
-                .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))?
-                .ok_or(eyre!("block not found"))
-        }
+        self.fetch_block(BlockId::Hash(hash.into()), full_txs)
+            .await
+            .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))
     }
 
     /// Fetches a full block by its number.
     pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
-        if full_txs {
-            self.provider
-                .get_block(number.into())
-                .full()
-                .await
-                .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))?
-                .ok_or(eyre!("block not found"))
+        self.fetch_block(BlockId::Number(number.into()), full_txs)
+            .await
+            .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))
+    }
+
+    /// Generic helper to fetch a block by its ID (hash or number).
+    async fn fetch_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
+        let block_request = self.provider.get_block(block_id);
+
+        let block = if full_txs {
+            block_request.full().await?
         } else {
-            self.provider
-                .get_block(number.into())
-                .await
-                .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))?
-                .ok_or(eyre!("block not found"))
-        }
+            block_request.await?
+        };
+
+        block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
     }
 }
 
@@ -158,7 +148,7 @@ impl RpcClient {
 /// Returns a `jsonrpsee` `ErrorObjectOwned` if any block is invalid, not found, or has
 /// not yet been successfully validated.
 pub fn get_blob_ids(
-    stateless_dir: &PathBuf,
+    stateless_dir: &Path,
     blocks: Vec<String>,
 ) -> Result<HashMap<String, Vec<B256>>, ErrorObjectOwned> {
     let mut results = HashMap::new();
@@ -189,7 +179,7 @@ pub fn get_blob_ids(
         })?;
 
         let validation =
-            load_validate_info(&stateless_dir, block_number, block_hash).map_err(|e| {
+            load_validate_info(stateless_dir, block_number, block_hash).map_err(|e| {
                 ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
             })?;
 
@@ -218,11 +208,7 @@ pub fn get_blob_ids(
             ValidateStatus::Success => {
                 results.insert(
                     block,
-                    validation
-                        .blob_ids
-                        .into_iter()
-                        .map(|id| B256::from(id))
-                        .collect(),
+                    validation.blob_ids.into_iter().map(B256::from).collect(),
                 );
             }
         }

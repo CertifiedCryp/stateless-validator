@@ -9,7 +9,7 @@ use revm::{
 };
 use salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -85,7 +85,6 @@ async fn main() -> Result<()> {
     let finalized_num = chain_status.block_number;
 
     // Start validating from the block after the last finalized one.
-    // Note: Block 1 cannot be replayed currently, this needs further investigation.
     let block_counter = finalized_num + 1;
     let validator_logic = scan_and_validate_block_witnesses(
         client,
@@ -138,7 +137,7 @@ async fn main() -> Result<()> {
 /// concurrently.
 async fn scan_and_validate_block_witnesses(
     client: Arc<RpcClient>,
-    stateless_dir: &PathBuf,
+    stateless_dir: &Path,
     block_counter: u64,
     lock_time: u64,
     concurrent_num: usize,
@@ -161,11 +160,30 @@ async fn scan_and_validate_block_witnesses(
             let contracts = Arc::clone(&contracts);
 
             async move {
-                if let Err(e) =
-                    validate_block(client, &stateless_dir, block_counter, lock_time, contracts)
-                        .await
+                // Continuously validate blocks, retrying on failure until the block becomes stale.
+                // The loop breaks if validation succeeds or if the block is older than the
+                // latest finalized block.
+                while let Err(e) = validate_block(
+                    client.clone(),
+                    &stateless_dir,
+                    block_counter,
+                    lock_time,
+                    contracts.clone(),
+                )
+                .await
                 {
-                    error!("Failed to validate block {}: {:?}", block_counter, e);
+                    error!(
+                        "Failed to validate block {}: {:?}, try block({}) again",
+                        block_counter, e, block_counter
+                    );
+                    let chain_status = get_chain_status(&stateless_dir).unwrap_or_default();
+                    if block_counter <= chain_status.block_number {
+                        info!(
+                            "block({}) is less than finalized block({}), skipping",
+                            block_counter, chain_status.block_number
+                        );
+                        break;
+                    }
                 }
             }
         })
@@ -187,7 +205,7 @@ async fn scan_and_validate_block_witnesses(
 /// 8. Updates the validation status of the block.
 async fn validate_block(
     client: Arc<RpcClient>,
-    stateless_dir: &PathBuf,
+    stateless_dir: &Path,
     block_counter: u64,
     lock_time: u64,
     contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
@@ -381,7 +399,7 @@ async fn validate_block(
 /// falls back to fetching the block from the RPC endpoint.
 async fn get_root(
     client: &RpcClient,
-    stateless_dir: &PathBuf,
+    stateless_dir: &Path,
     block_number: u64,
     block_hash: B256,
 ) -> Result<B256> {

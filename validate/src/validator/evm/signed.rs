@@ -1,3 +1,9 @@
+//! A signed Optimism transaction, used to convert [`op_alloy_rpc_types::Transaction`] to
+//! [`mega_evm::Transaction`];
+//!
+//! ref:
+//! https://github.com/megaeth-labs/mega-reth/blob/refactor/base-on-v1.3.4/crates/optimism/primitives/src/transaction/signed.rs
+
 use alloy_consensus::{Transaction as TransactionTrait, Typed2718};
 use alloy_eips::{eip2718::Encodable2718, eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_evm::FromRecoveredTx;

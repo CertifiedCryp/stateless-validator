@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fs::{File, OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    path::Path,
     str::FromStr,
 };
 
@@ -49,7 +49,7 @@ pub struct ValidateInfo {
 /// from validate or backup directory.
 /// If the file does not exist, it returns a default `ValidateInfo` instance.
 pub fn load_validate_info(
-    path: &PathBuf,
+    path: &Path,
     block_number: BlockNumber,
     block_hash: BlockHash,
 ) -> Result<ValidateInfo> {
@@ -92,7 +92,7 @@ pub fn load_validate_info(
 
 /// Removes the validation file for a given block.
 pub fn remove_block_validate(
-    path: &PathBuf,
+    path: &Path,
     block: (BlockNumber, BlockHash),
 ) -> std::io::Result<bool> {
     let mut remove = false;
@@ -108,7 +108,7 @@ pub fn remove_block_validate(
 
 /// Creates a backup of the validation file for a given block.
 pub fn backup_block_validate(
-    path: &PathBuf,
+    path: &Path,
     block: (BlockNumber, BlockHash),
 ) -> std::io::Result<bool> {
     let mut backup = false;
@@ -128,7 +128,7 @@ pub fn backup_block_validate(
 /// This function loads the existing `ValidateInfo`, updates its fields with the provided
 /// values, and then saves it back to a file atomically.
 pub fn set_validate_status(
-    path: &PathBuf,
+    path: &Path,
     block_number: BlockNumber,
     block_hash: BlockHash,
     status: ValidateStatus,
@@ -172,7 +172,7 @@ pub fn set_validate_status(
 ///
 /// Returns `Ok(T)` containing the deserialized data if successful.
 /// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
-pub fn load_json_file<T: DeserializeOwned>(data_dir: &PathBuf, file_name: &str) -> Result<T> {
+pub fn load_json_file<T: DeserializeOwned>(data_dir: &Path, file_name: &str) -> Result<T> {
     let json_file = data_dir.join(file_name);
 
     let mut file = File::open(&json_file)
@@ -208,7 +208,7 @@ pub fn load_json_file<T: DeserializeOwned>(data_dir: &PathBuf, file_name: &str) 
 /// Returns `Ok(())` if the data is successfully serialized and written to the file.
 /// Returns an `Err` if any step (directory creation, file opening, serialization, or writing)
 /// fails.
-pub fn store_json_file<T: Serialize>(data: T, data_dir: &PathBuf, file_name: &str) -> Result<()> {
+pub fn store_json_file<T: Serialize>(data: T, data_dir: &Path, file_name: &str) -> Result<()> {
     create_dir_all(data_dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;
 
     let json_file = data_dir.join(file_name);
@@ -218,6 +218,7 @@ pub fn store_json_file<T: Serialize>(data: T, data_dir: &PathBuf, file_name: &st
     let mut json_fp = File::options()
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&json_file)
         .map_err(|e| {
             anyhow!(
@@ -246,7 +247,7 @@ pub fn store_json_file<T: Serialize>(data: T, data_dir: &PathBuf, file_name: &st
 /// This is achieved by writing to a temporary file first and then renaming it to the
 /// final destination. This ensures that a reader will never see a partially written file.
 fn save_validate_info(
-    path: &PathBuf,
+    path: &Path,
     block_number: BlockNumber,
     block_hash: BlockHash,
     validate_info: ValidateInfo,
@@ -286,7 +287,7 @@ fn save_validate_info(
 /// directory to find a file matching the block number and extracts the hash from its name.
 pub fn read_block_hash_by_number_from_file(
     block_number: u64,
-    stateless_path: &PathBuf,
+    stateless_path: &Path,
 ) -> Result<Vec<B256>> {
     let witness_dir = stateless_path.join("witness");
     let block_number_str = block_number.to_string();
@@ -350,7 +351,7 @@ pub fn validate_file_name(block_num: BlockNumber, block_hash: BlockHash) -> Stri
 /// # Example file content:
 /// ["0x...", "0x..."]
 /// ["0x...", "0x..."]
-pub fn load_contracts_file(data_dir: &PathBuf, file_name: &str) -> Result<HashMap<B256, Bytecode>> {
+pub fn load_contracts_file(data_dir: &Path, file_name: &str) -> Result<HashMap<B256, Bytecode>> {
     let json_file = data_dir.join(file_name);
     if !json_file.exists() {
         return Ok(HashMap::default());
@@ -384,7 +385,7 @@ pub fn load_contracts_file(data_dir: &PathBuf, file_name: &str) -> Result<HashMa
 /// The item is serialized to a JSON string and written on a new line.
 pub fn append_json_line_to_file<T: Serialize>(
     data: &T,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     file_name: &str,
 ) -> Result<()> {
     create_dir_all(data_dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;

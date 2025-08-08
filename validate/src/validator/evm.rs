@@ -12,10 +12,12 @@ use alloy_rpc_types_eth::{Block, BlockTransactions};
 use eyre::{Result, eyre};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
+use op_revm::L1BlockInfo;
 use revm::{
-    context::{BlockEnv, CfgEnv},
+    context::{BlockEnv, CfgEnv, ContextTr},
     database::states::{CacheAccount, StateBuilder},
-    primitives::{Address, HashMap},
+    handler::EvmTr,
+    primitives::{Address, HashMap, U256, hardfork::SpecId as RevmSpecId},
 };
 
 use crate::validator::WitnessProvider;
@@ -44,7 +46,6 @@ mod signed;
 /// Returns `Ok(())` if the block replay is successful. Returns an `Err` if any part of the
 /// replay process fails, such as encountering wrong transaction types, issues with
 /// block data, or errors during EVM execution.
-
 pub fn replay_block(
     block: Block<OpTransaction>,
     provider: &WitnessProvider,
@@ -56,7 +57,7 @@ pub fn replay_block(
     let mut state = StateBuilder::new().with_database_ref(provider).build();
 
     let block_executor_factory = BlockExecutorFactory::new(
-        ChainSpec::default(),
+        ChainSpec,
         EvmFactory::default(),
         OpRethReceiptBuilder::default(),
     );
@@ -68,14 +69,20 @@ pub fn replay_block(
     };
 
     let block_env = get_block_env(&block)?;
-    let evm_env: EvmEnv<SpecId> = EvmEnv::new(CfgEnv::default(), block_env);
+    let evm_env: EvmEnv<SpecId> = EvmEnv::new(get_evm_config(), block_env);
 
-    let mut block_executor = block_executor_factory.create_executor(
-        block_executor_factory
-            .evm_factory()
-            .create_evm(&mut state, evm_env),
-        op_block_execution_ctx,
-    );
+    let mut l1_block_info = L1BlockInfo::default();
+    l1_block_info.operator_fee_scalar = Some(U256::from(0));
+    l1_block_info.operator_fee_constant = Some(U256::from(0));
+
+    let mut evm = block_executor_factory
+        .evm_factory()
+        .create_evm(&mut state, evm_env);
+
+    // to fix l1_block_info.operator_fee_scalar.expect() when set blockhash in apply_pre_execution_changes
+    *evm.ctx().chain() = l1_block_info;
+
+    let mut block_executor = block_executor_factory.create_executor(evm, op_block_execution_ctx);
 
     block_executor
         .apply_pre_execution_changes()
@@ -92,10 +99,6 @@ pub fn replay_block(
     block_executor
         .apply_post_execution_changes()
         .map_err(|e| eyre!("apply_post_execution_changes failed: {:?}", e))?;
-
-    // let (evm, result) = block_executor
-    //     .finish()
-    //     .map_err(|e| eyre!("finish failed: {:?}", e))?;
 
     Ok(state.cache.accounts)
 }
@@ -135,29 +138,18 @@ fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
     Ok(block_env)
 }
 
-// / Creates a `CfgEnvWithHandlerCfg` with specific Optimism configurations.
-// /
-// / The configuration values (e.g., chain_id, memory_limit, spec_id) are hardcoded
-// / here for simplicity, but in a production environment, they would typically be
-// / derived from chain specifications or other configuration sources.
-// fn get_evm_config() -> CfgEnvWithHandlerCfg {
-//     let mut cfg_env = CfgEnv::default();
+// Creates a CfgEnvWithHandlerCfg with specific Optimism configurations.
+// The configuration values (e.g., chain_id, memory_limit, spec_id) are
+// typically derived from sequencer logs or chain specifications.
+fn get_evm_config() -> CfgEnv<SpecId> {
+    let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
 
-//     cfg_env.chain_id = 6342;
-//     cfg_env.blob_target_and_max_count = vec![(SpecId::CANCUN, 3, 6), (SpecId::PRAGUE, 6, 9)];
-//     cfg_env.memory_limit = u32::MAX as u64;
-
-//     CfgEnvWithHandlerCfg {
-//         cfg_env,
-//         handler_cfg: HandlerCfg {
-//             // Set the EVM specification ID. This should be kept up to date with the network's
-//             // current hardfork.
-//             spec_id: SpecId::PRAGUE,
-//             // Enable Optimism-specific EVM rules.
-//             is_optimism: true,
-//         },
-//     }
-// }
+    cfg_env.chain_id = 6342;
+    cfg_env.blob_target_and_max_count =
+        vec![(RevmSpecId::CANCUN, 3, 6), (RevmSpecId::PRAGUE, 6, 9)];
+    cfg_env.memory_limit = 4294967295; // u32::MAX
+    cfg_env
+}
 
 #[derive(Default, Clone, Copy)]
 struct ChainSpec;
@@ -165,10 +157,10 @@ struct ChainSpec;
 impl EthereumHardforks for ChainSpec {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
         match fork {
-            EthereumHardfork::Shanghai
-            | EthereumHardfork::Cancun
-            | EthereumHardfork::Prague
-            | EthereumHardfork::Osaka => ForkCondition::Timestamp(0),
+            EthereumHardfork::Shanghai | EthereumHardfork::Cancun | EthereumHardfork::Prague => {
+                ForkCondition::Timestamp(0)
+            }
+            EthereumHardfork::Osaka => ForkCondition::Never,
             _ => ForkCondition::Block(0),
         }
     }
@@ -178,6 +170,7 @@ impl OpHardforks for ChainSpec {
     fn op_fork_activation(&self, fork: OpHardfork) -> ForkCondition {
         match fork {
             OpHardfork::Bedrock => ForkCondition::Block(0),
+            OpHardfork::Interop => ForkCondition::Never,
             _ => ForkCondition::Timestamp(0),
         }
     }

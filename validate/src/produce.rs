@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::OpenOptions,
     io::{Read, Result},
-    path::PathBuf,
+    path::Path,
 };
 
 /// the chain status, which contains the finalized block number, block hash
@@ -19,7 +19,7 @@ pub struct ChainStatus {
 }
 
 /// Get the chain status from file
-pub fn get_chain_status(path: &PathBuf) -> Result<ChainStatus> {
+pub fn get_chain_status(path: &Path) -> Result<ChainStatus> {
     let path = path.join("chain.status");
     let mut file = OpenOptions::new().read(true).open(&path)?;
     let mut contents = String::new();
