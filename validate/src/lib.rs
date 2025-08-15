@@ -79,6 +79,17 @@ pub fn file_name_hash(file_name: &str) -> BlockHash {
 }
 
 /// Get backup file name from block number
-pub fn backup_file(block_num: BlockNumber, ext: &str) -> String {
-    format!("backup/{}/{}{}", block_num >> BACKUP_SHIFT, block_num, ext)
+pub fn backup_file(block_num: BlockNumber, block_hash: BlockHash, ext: &str) -> String {
+    format!(
+        "backup/{}/{}.{}{}",
+        block_num >> BACKUP_SHIFT,
+        block_num,
+        block_hash,
+        ext
+    )
+}
+
+/// Get the backup directory path from the block number
+pub fn backup_dir(block_num: BlockNumber) -> String {
+    format!("backup/{}", block_num >> BACKUP_SHIFT)
 }

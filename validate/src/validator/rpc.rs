@@ -6,7 +6,11 @@
 //!
 //! The `get_blob_ids` function acts as an RPC endpoint handler, allowing clients to query
 //! the validation status and retrieve blob information for a given block.
-use crate::file::{ValidateStatus, load_validate_info};
+use crate::file::{
+    ValidateStatus, load_from_file_or_backup, load_validate_info,
+    read_block_hash_by_number_from_file,
+};
+use alloy_primitives::hex;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
@@ -154,29 +158,7 @@ pub fn get_blob_ids(
     let mut results = HashMap::new();
 
     for block in blocks {
-        let parts: Vec<&str> = block.splitn(2, '.').collect();
-        if parts.len() != 2 {
-            return Err(ErrorObject::owned(
-                INVALID_PARAMS_CODE,
-                format!("invalid params format: {}", block),
-                None::<()>,
-            ));
-        }
-
-        let block_number = parts[0].parse::<u64>().map_err(|_| {
-            ErrorObject::owned(
-                INVALID_PARAMS_CODE,
-                format!("invalid block number: {}", parts[0]),
-                None::<()>,
-            )
-        })?;
-        let block_hash = B256::from_str(parts[1]).map_err(|_| {
-            ErrorObject::owned(
-                INVALID_PARAMS_CODE,
-                format!("invalid block hash: {}", parts[1]),
-                None::<()>,
-            )
-        })?;
+        let (block_number, block_hash) = parse_num_hash(&block)?;
 
         let validation =
             load_validate_info(stateless_dir, block_number, block_hash).map_err(|e| {
@@ -215,4 +197,77 @@ pub fn get_blob_ids(
     }
 
     Ok(results)
+}
+
+/// Get the witness for a block.
+pub fn get_witness(
+    stateless_dir: &Path,
+    block_info: String,
+) -> Result<String, ErrorObjectOwned> {
+    let (block_number, parent_hash) = parse_num_hash(&block_info)?;
+
+    // get the witness from witness directory
+    let witness_dir = stateless_dir.join("witness");
+    let block_hashes =
+        if let Ok(hashes) = read_block_hash_by_number_from_file(block_number, &witness_dir) {
+            hashes
+        } else {
+            let backup_dir = stateless_dir.join(crate::backup_dir(block_number));
+            read_block_hash_by_number_from_file(block_number, &backup_dir).map_err(|_| {
+                ErrorObject::owned(
+                    INVALID_PARAMS_CODE,
+                    format!("not found block number: {}", block_number),
+                    None::<()>,
+                )
+            })?
+        };
+
+    for block_hash in block_hashes {
+        let witness =
+            load_from_file_or_backup(stateless_dir, block_number, block_hash).map_err(|e| {
+                ErrorObject::owned(
+                    INVALID_PARAMS_CODE,
+                    format!("block {block_number} err:{e}"),
+                    None::<()>,
+                )
+            })?;
+        if witness.parent_hash == parent_hash {
+            // Return the witness data as a hex-encoded string
+            return Ok(hex::encode(&witness.witness_data));
+        }
+    }
+
+    Err(ErrorObject::owned(
+        INVALID_PARAMS_CODE,
+        format!("not found witness for block {block_info}"),
+        None::<()>,
+    ))
+}
+
+fn parse_num_hash(block: &str) -> Result<(u64, B256), ErrorObjectOwned> {
+    let parts: Vec<&str> = block.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return Err(ErrorObject::owned(
+            INVALID_PARAMS_CODE,
+            format!("invalid params format: {}", block),
+            None::<()>,
+        ));
+    }
+
+    let block_number = parts[0].parse::<u64>().map_err(|_| {
+        ErrorObject::owned(
+            INVALID_PARAMS_CODE,
+            format!("invalid block number: {}", parts[0]),
+            None::<()>,
+        )
+    })?;
+    let block_hash = B256::from_str(parts[1]).map_err(|_| {
+        ErrorObject::owned(
+            INVALID_PARAMS_CODE,
+            format!("invalid block hash: {}", parts[1]),
+            None::<()>,
+        )
+    })?;
+
+    Ok((block_number, block_hash))
 }

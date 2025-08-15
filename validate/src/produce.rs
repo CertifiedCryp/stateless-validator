@@ -27,8 +27,3 @@ pub fn get_chain_status(path: &Path) -> Result<ChainStatus> {
     let status: ChainStatus = serde_json::from_str(&contents)?;
     Ok(status)
 }
-
-/// file name for the delta file
-pub fn delta_file_name(block_num: BlockNumber, block_hash: BlockHash) -> String {
-    format!("{}.{}.d", block_num, block_hash)
-}

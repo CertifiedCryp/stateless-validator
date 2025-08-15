@@ -33,15 +33,17 @@ pub struct WitnessStatus {
     pub block_hash: BlockHash,
     /// restore the block number
     pub block_number: BlockNumber,
+    /// restore the parent block hash
+    pub parent_hash: BlockHash,
+    /// restore the pre state root
+    /// this is used to verify the block witness
+    pub pre_state_root: B256,
     /// locking the task brefore the timeout
     pub lock_time: u64,
     /// record the blob ids
     pub blob_ids: Vec<[u8; 32]>,
     /// record the block witness data with bytes
     pub witness_data: Vec<u8>,
-    /// restore the pre state root
-    /// this is used to verify the block witness
-    pub pre_state_root: B256,
 }
 
 /// get block witness status by given blocknum and blockhash
@@ -57,10 +59,11 @@ pub fn get_witness_state(
             status: SaltWitnessState::Idle,
             block_hash: block.1,
             block_number: block.0,
+            parent_hash: BlockHash::default(),
+            pre_state_root: B256::default(),
             lock_time: curent_time_to_u64(),
             blob_ids: vec![],
             witness_data: vec![],
-            pre_state_root: B256::default(),
         });
     }
     let mut file = OpenOptions::new().read(true).open(path)?;

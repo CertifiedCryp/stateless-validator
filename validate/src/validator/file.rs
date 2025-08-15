@@ -1,6 +1,9 @@
 //! This module handles file-based operations for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
-use crate::{curent_time_to_u64, deserialized_state_data, serialized_state_data};
+use crate::{
+    WitnessStatus, curent_time_to_u64, deserialized_state_data, serialized_state_data,
+    witness_file_name,
+};
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
 use fs2::FileExt;
@@ -56,7 +59,7 @@ pub fn load_validate_info(
     let validate_path = path
         .join("validate")
         .join(validate_file_name(block_number, block_hash));
-    let backup_path = path.join(crate::backup_file(block_number, ".v"));
+    let backup_path = path.join(crate::backup_file(block_number, block_hash, ".v"));
     if !validate_path.exists() && !backup_path.exists() {
         return Ok(ValidateInfo::default());
     }
@@ -83,44 +86,44 @@ pub fn load_validate_info(
                 )
             },
         )?;
-    if validation.block_hash == block_hash {
-        Ok(validation)
+    Ok(validation)
+}
+
+/// Loads the `WitnessStatus` for a specific block from a file
+/// from witness or backup directory.
+pub fn load_from_file_or_backup(
+    path: &Path,
+    block_number: BlockNumber,
+    block_hash: BlockHash,
+) -> Result<WitnessStatus> {
+    let witness_path = path
+        .join("witness")
+        .join(witness_file_name(block_number, block_hash));
+    let backup_path = path.join(crate::backup_file(block_number, block_hash, ".w"));
+
+    let mut file = if let Ok(file) = OpenOptions::new().read(true).open(witness_path) {
+        file
     } else {
-        Ok(ValidateInfo::default())
-    }
-}
+        OpenOptions::new()
+            .read(true)
+            .open(&backup_path)
+            .map_err(|e| anyhow!("block({block_number}): {}", e))?
+    };
+    let mut contents = vec![];
+    file.read_to_end(&mut contents)?;
+    let state_data =
+        deserialized_state_data(contents).map_err(|e| anyhow!("block({block_number}): {}", e))?;
 
-/// Removes the validation file for a given block.
-pub fn remove_block_validate(
-    path: &Path,
-    block: (BlockNumber, BlockHash),
-) -> std::io::Result<bool> {
-    let mut remove = false;
-    let path = path
-        .join("validate")
-        .join(validate_file_name(block.0, block.1));
-    if path.exists() {
-        remove = true;
-        std::fs::remove_file(path)?;
-    }
-    Ok(remove)
-}
-
-/// Creates a backup of the validation file for a given block.
-pub fn backup_block_validate(
-    path: &Path,
-    block: (BlockNumber, BlockHash),
-) -> std::io::Result<bool> {
-    let mut backup = false;
-    let validate_path = path
-        .join("validate")
-        .join(validate_file_name(block.0, block.1));
-    let backup_path = path.join(crate::backup_file(block.0, ".v"));
-    if validate_path.exists() && !backup_path.exists() {
-        backup = true;
-        std::fs::copy(validate_path, backup_path)?;
-    }
-    Ok(backup)
+    let (witness, _): (WitnessStatus, usize) =
+        bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy()).map_err(
+            |e| {
+                anyhow!(
+                    "block({block_number}, {block_hash}): Failed to deserialize validate info: {}",
+                    e
+                )
+            },
+        )?;
+    Ok(witness)
 }
 
 /// Sets and saves the validation status and other metadata for a block.
@@ -287,9 +290,8 @@ fn save_validate_info(
 /// directory to find a file matching the block number and extracts the hash from its name.
 pub fn read_block_hash_by_number_from_file(
     block_number: u64,
-    stateless_path: &Path,
+    witness_dir: &Path,
 ) -> Result<Vec<B256>> {
-    let witness_dir = stateless_path.join("witness");
     let block_number_str = block_number.to_string();
     let file_prefix = format!("{}.", block_number_str);
     const FILE_SUFFIX: &str = ".w";
@@ -334,7 +336,7 @@ pub fn read_block_hash_by_number_from_file(
             "No witness file found for block {} with pattern '{}.HASH.w' in {:?}",
             block_number,
             block_number_str,
-            stateless_path.join("witness")
+            witness_dir
         ))
     } else {
         Ok(hashes)
@@ -480,7 +482,7 @@ mod tests {
 
         let block_number = 2u64;
         let block_hash = dummy_block_hash();
-        let backup_file = path.join(crate::backup_file(block_number, ".v"));
+        let backup_file = path.join(crate::backup_file(block_number, block_hash, ".v"));
 
         // Construct a ValidateInfo and serialize it to the backup file
         let info = ValidateInfo {

@@ -2,7 +2,10 @@ use alloy_primitives::Address;
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::stream::{self, StreamExt};
-use jsonrpsee::{RpcModule, server::Server};
+use jsonrpsee::{
+    RpcModule,
+    server::{ServerBuilder, ServerConfigBuilder},
+};
 use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
@@ -27,9 +30,13 @@ use validate::{
             ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
             read_block_hash_by_number_from_file, set_validate_status,
         },
-        rpc::{RpcClient, get_blob_ids},
+        rpc::{RpcClient, get_blob_ids, get_witness},
     },
 };
+
+/// Maximum response body size for the RPC server.
+/// This is set to 100 MB to accommodate large block data and witness information.
+const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Command line arguments for the `rerun_block` executable.
 #[derive(Parser, Debug)]
@@ -102,7 +109,20 @@ async fn main() -> Result<()> {
             get_blob_ids(path, blocks)
         })?;
 
-        let server = Server::builder().build(format!("0.0.0.0:{}", port)).await?;
+        module.register_method("stateless_getWitness", |params, path, _| {
+            let block_info: String = params.parse()?;
+            get_witness(path, block_info)
+        })?;
+
+        //let server = Server::builder().build(format!("0.0.0.0:{}", port)).await?;
+        let cfg = ServerConfigBuilder::default()
+            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
+            .build();
+        let server = ServerBuilder::default()
+            .set_config(cfg)
+            .build(format!("0.0.0.0:{}", port))
+            .await?;
+
         let addr = server.local_addr()?.to_string();
         info!("Server listening on {}", addr);
 
@@ -211,6 +231,7 @@ async fn validate_block(
     contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
 ) -> Result<()> {
     let validate_path = stateless_dir.join("validate");
+    let witness_dir = stateless_dir.join("witness");
     let contracts_file = "contracts.txt";
 
     info!("Processing block: {}", block_counter);
@@ -219,7 +240,7 @@ async fn validate_block(
 
     // This loop waits for the witness for the block to be generated and available.
     while loops {
-        let block_hashes = match read_block_hash_by_number_from_file(block_counter, stateless_dir) {
+        let block_hashes = match read_block_hash_by_number_from_file(block_counter, &witness_dir) {
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
