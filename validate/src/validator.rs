@@ -4,7 +4,7 @@
 //! This allows it to act as a read-only database for REVM, but instead of fetching data from a
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
-use crate::formate::{Account, PlainKey, PlainValue};
+use crate::format::{Account, PlainKey, PlainValue};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use op_alloy_network::Optimism;
@@ -178,10 +178,7 @@ impl From<HashMap<Address, CacheAccount>> for PlainKeyUpdate {
             let account_key = PlainKey::Account(address).encode();
 
             let (info, _) = account.into_components();
-            if info.is_none() {
-                continue;
-            } else {
-                let (info, storage) = info.unwrap();
+            if let Some((info, storage)) = info {
                 // handle account
                 let plain_account = Account {
                     nonce: info.nonce,
