@@ -8,6 +8,7 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
+use validator_core::withdrawals::MptWitness;
 
 /// Response from mega_setValidatedBlocks RPC call
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,7 +125,7 @@ impl RpcClient {
     ///
     /// # Errors
     /// Returns error if block hash doesn't exist, witness unavailable
-    pub async fn get_witness(&self, number: u64, hash: B256) -> Result<SaltWitness> {
+    pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         self.witness_provider
             .client()
             .request("mega_getBlockWitness", (number.to_string(), hash))

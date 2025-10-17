@@ -70,16 +70,18 @@ use thiserror::Error;
 use std::fmt;
 
 use crate::executor::{ValidationError, ValidationResult};
+use crate::withdrawals::MptWitness;
 
 /// Stores our local view of the canonical chain.
 ///
-/// **Schema:** Maps BlockNumber (u64) to (BlockHash, PostStateRoot) as ([u8; 32], [u8; 32])
+/// **Schema:** Maps BlockNumber (u64) to (BlockHash, PostStateRoot, PostWithdrawalsRoot) as ([u8; 32], [u8; 32], [u8; 32])
 /// - Key: Block height as BlockNumber (u64)
-/// - Value: (Block hash as [u8; 32], Post-state root as [u8; 32])
+/// - Value: (Block hash as [u8; 32], Post-state root as [u8; 32], Post-withdrawals root as [u8; 32])
 ///
 /// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
-const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32])> =
+#[allow(clippy::type_complexity)]
+const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32], [u8; 32])> =
     TableDefinition::new("canonical_chain");
 
 /// Stores the remote chain with unvalidated blocks used to guide chain advancement.
@@ -137,6 +139,16 @@ const BLOCK_DATA: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("blo
 /// without full blockchain state. Retrieved alongside block data during
 /// get_next_task() for validation execution.
 const WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("witnesses");
+
+/// MPT witness data required for validating withdrawal transactions.
+///
+/// **Schema:** Maps BlockHash ([u8; 32]) to serialized MPT witness data (Vec<u8>)
+/// - Key: Block hash as BlockHash ([u8; 32])
+/// - Value: Serialized MPT witness data as Vec<u8>
+///
+/// Contains cryptographic proofs and state information that enables withdrawal validation
+/// without full blockchain state. Always used alongside with the [`WITNESSES`] table.
+const MPT_WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("mpt_witnesses");
 
 /// Outcomes of completed block validation attempts.
 ///
@@ -235,6 +247,7 @@ impl_database_error_from!(
 pub enum MissingDataKind {
     BlockData,
     Witness,
+    MptWitness,
     ValidationResult,
 }
 
@@ -243,6 +256,7 @@ impl fmt::Display for MissingDataKind {
         let label = match self {
             MissingDataKind::BlockData => "block data",
             MissingDataKind::Witness => "witness",
+            MissingDataKind::MptWitness => "mpt witness",
             MissingDataKind::ValidationResult => "validation result",
         };
         f.write_str(label)
@@ -293,6 +307,7 @@ impl ValidatorDB {
             let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
             let _block_data = write_txn.open_table(BLOCK_DATA)?;
             let _witnesses = write_txn.open_table(WITNESSES)?;
+            let _mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
@@ -314,6 +329,7 @@ impl ValidatorDB {
         &self,
         block: &Block<Transaction>,
         witness: &SaltWitness,
+        mpt_witness: &MptWitness,
     ) -> ValidationDbResult<()> {
         let block_number = block.header.number;
         let block_hash = block.header.hash.0;
@@ -333,6 +349,11 @@ impl ValidatorDB {
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let serialized_witness = encode_to_vec(witness)?;
             witnesses.insert(block_hash, serialized_witness)?;
+
+            // ... and the mpt witness (MPT_WITNESSES)
+            let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
+            let serialized_mpt_witness = encode_to_vec(mpt_witness)?;
+            mpt_witnesses.insert(block_hash, serialized_mpt_witness)?;
 
             // Records the block in the block registry (BLOCK_RECORDS)
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
@@ -450,13 +471,13 @@ impl ValidatorDB {
 
             // Verify parent chain extension for non-genesis blocks
             if header.number > 0 {
-                let parent_post_state = B256::from(
-                    canonical_chain
+                let (parent_post_state, parent_post_withdrawals) = {
+                    let parent_value = canonical_chain
                         .get(header.number - 1)?
                         .expect("parent block must exist in canonical chain")
-                        .value()
-                        .1,
-                );
+                        .value();
+                    (B256::from(parent_value.1), B256::from(parent_value.2))
+                };
 
                 if result.pre_state_root != parent_post_state {
                     return Err(ValidationError::PreStateRootMismatch {
@@ -465,10 +486,25 @@ impl ValidatorDB {
                     }
                     .into());
                 }
+
+                if result.pre_withdrawals_root != parent_post_withdrawals {
+                    return Err(ValidationError::PreWithdrawalsRootMismatch {
+                        expected: parent_post_withdrawals,
+                        actual: result.pre_withdrawals_root,
+                    }
+                    .into());
+                }
             }
 
             // Move block from remote to canonical chain
-            canonical_chain.insert(header.number, (header.hash.0, result.post_state_root.0))?;
+            canonical_chain.insert(
+                header.number,
+                (
+                    header.hash.0,
+                    result.post_state_root.0,
+                    result.post_withdrawals_root.0,
+                ),
+            )?;
             remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
@@ -494,7 +530,7 @@ impl ValidatorDB {
                 (last_remote.0.value(), last_remote.1.value())
             } else if let Some(last_canonical) = canonical_chain.last()? {
                 let (canonical_number, canonical_value) = last_canonical;
-                let (canonical_hash, _) = canonical_value.value();
+                let (canonical_hash, _, _) = canonical_value.value();
                 (canonical_number.value(), canonical_hash)
             } else {
                 (0, [0u8; 32])
@@ -591,7 +627,9 @@ impl ValidatorDB {
     /// - `Ok(Some((block, witness)))` - Next task with all required validation data
     /// - `Ok(None)` - No tasks available, worker should wait or exit
     /// - `Err(...)` - Database error, serialization failure, or missing block/witness data
-    pub fn get_next_task(&self) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness)>> {
+    pub fn get_next_task(
+        &self,
+    ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
         let write_txn = self.database.begin_write()?;
 
         let result = {
@@ -627,6 +665,7 @@ impl ValidatorDB {
                     // Load block data and witness
                     let block_data = write_txn.open_table(BLOCK_DATA)?;
                     let witnesses = write_txn.open_table(WITNESSES)?;
+                    let mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
 
                     let block = decode_block_from_slice(
                         &block_data
@@ -646,8 +685,17 @@ impl ValidatorDB {
                             })?
                             .value(),
                     );
+                    let mpt_witness = decode_from_slice(
+                        &mpt_witnesses
+                            .get(block_hash_bytes)?
+                            .ok_or_else(|| ValidationDbError::MissingData {
+                                kind: MissingDataKind::MptWitness,
+                                block_hash,
+                            })?
+                            .value(),
+                    );
 
-                    Some((block, witness))
+                    Some((block, witness, mpt_witness))
                 }
                 None => None,
             }
@@ -685,7 +733,7 @@ impl ValidatorDB {
         match canonical_chain.last()? {
             Some((canonical_key, canonical_value)) => {
                 let block_number = canonical_key.value();
-                let (block_hash, _) = canonical_value.value();
+                let (block_hash, _, _) = canonical_value.value();
                 Ok(Some((block_number, block_hash.into())))
             }
             None => Ok(None),
@@ -719,6 +767,7 @@ impl ValidatorDB {
         block_number: BlockNumber,
         block_hash: BlockHash,
         post_state_root: B256,
+        post_withdrawals_root: B256,
     ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
@@ -726,7 +775,10 @@ impl ValidatorDB {
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
             canonical_chain.retain(|_, _| false)?;
-            canonical_chain.insert(block_number, (block_hash.0, post_state_root.0))?;
+            canonical_chain.insert(
+                block_number,
+                (block_hash.0, post_state_root.0, post_withdrawals_root.0),
+            )?;
             remote_chain.retain(|_, _| false)?;
         }
         write_txn.commit()?;
@@ -760,6 +812,7 @@ impl ValidatorDB {
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
+            let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
 
             // Collect keys to remove (blocks older than before_block)
@@ -776,6 +829,7 @@ impl ValidatorDB {
                 block_records.remove((block_number, block_hash))?;
                 block_data.remove(block_hash)?;
                 witnesses.remove(block_hash)?;
+                mpt_witnesses.remove(block_hash)?;
                 validation_results.remove(block_hash)?;
             }
 
@@ -848,7 +902,7 @@ impl ValidatorDB {
 
         Ok(canonical_chain.first()?.map(|(key, value)| {
             let block_number = key.value();
-            let (block_hash, _post_state_root) = value.value();
+            let (block_hash, _, _) = value.value();
             (block_number, block_hash.into())
         }))
     }

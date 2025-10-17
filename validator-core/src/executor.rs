@@ -30,14 +30,14 @@ use alloy_evm::{
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
-    database::states::StateBuilder,
+    database::states::{CacheAccount, StateBuilder},
     handler::EvmTr,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
@@ -50,7 +50,8 @@ use thiserror::Error;
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
-    database::WitnessDatabase,
+    database::{WitnessDatabase, WitnessDatabaseError, WitnessEnvOracle},
+    withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
 /// Errors that can occur during block validation.
@@ -58,6 +59,12 @@ use crate::{
 pub enum ValidationError {
     #[error("Witness proof verification failed: {0}")]
     WitnessVerificationFailed(#[source] salt::ProofError),
+
+    #[error("Failed to validate changes to the withdrawal contract: {0}")]
+    WithdrawalValidationFailed(#[source] withdrawals::WithdrawalValidationError),
+
+    #[error("Failed to construct mega-evm environment oracle: {0}")]
+    EnvOracleConstructionFailed(#[source] WitnessDatabaseError),
 
     #[error("Expecting full transaction data, only found hashes")]
     BlockIncomplete,
@@ -79,6 +86,14 @@ pub enum ValidationError {
         actual: B256,
     },
 
+    #[error("Pre-withdrawals root mismatch: expecting {expected:?}, got {actual:?}")]
+    PreWithdrawalsRootMismatch {
+        /// The post-withdrawals root of the parent block
+        expected: B256,
+        /// The pre-withdrawals root of the witness
+        actual: B256,
+    },
+
     #[error("State root mismatch: claimed {claimed}, got {actual}")]
     StateRootMismatch {
         /// The computed state root from transaction execution
@@ -95,6 +110,10 @@ pub struct ValidationResult {
     pub pre_state_root: B256,
     /// The post-state root after block execution (from block header)
     pub post_state_root: B256,
+    /// The pre-withdrawl root from the mpt witness before block execution
+    pub pre_withdrawals_root: B256,
+    /// The post-withdrawal root after block execution (from block header)
+    pub post_withdrawals_root: B256,
     /// The block number that was validated
     pub block_number: BlockNumber,
     /// The block hash that was validated
@@ -181,7 +200,8 @@ fn replay_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
-) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
+    env_oracle: WitnessEnvOracle,
+) -> Result<alloy_primitives::map::HashMap<Address, CacheAccount>, ValidationError> {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
         return Err(ValidationError::BlockIncomplete);
@@ -193,7 +213,7 @@ fn replay_block(
 
     let executor_factory = BlockExecutorFactory::new(
         chain_spec.clone(),
-        EvmFactory::default(),
+        EvmFactory::new(env_oracle),
         OpAlloyReceiptBuilder::default(),
     );
 
@@ -233,33 +253,7 @@ fn replay_block(
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    // Flatten Revm's CacheAccount format into plain key-value pairs
-    let mut state_updates = HashMap::default();
-    for (address, cached_account) in state.cache.accounts {
-        let (Some((account_info, storage)), _) = cached_account.into_components() else {
-            continue;
-        };
-
-        // Process account changes
-        let account = Account {
-            nonce: account_info.nonce,
-            balance: account_info.balance,
-            codehash: (account_info.code_hash != KECCAK_EMPTY).then_some(account_info.code_hash),
-        };
-
-        let account_key = PlainKey::Account(address).encode();
-        let account_value = (!account.is_empty()).then(|| PlainValue::Account(account).encode());
-        state_updates.insert(account_key, account_value);
-
-        // Process storage changes
-        for (slot, value) in storage {
-            let storage_key = PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
-            let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
-            state_updates.insert(storage_key, storage_value);
-        }
-    }
-
-    Ok(state_updates)
+    Ok(state.cache.accounts.clone())
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -285,8 +279,13 @@ pub fn validate_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
+    mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
+    // Create external environment oracle from salt witness
+    let env_oracle = WitnessEnvOracle::new(&salt_witness, block.header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
     // Verify witness proof against the current state root
     let witness = Witness::from(salt_witness);
     witness
@@ -299,7 +298,36 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let kv_updates = replay_block(chain_spec, block, &witness_db)?;
+    let accounts = replay_block(chain_spec, block, &witness_db, env_oracle)?;
+
+    // Filter out changes within the message passer contract
+    let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
+
+    // Flatten Revm's CacheAccount format into plain key-value pairs
+    let mut kv_updates: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+    for (address, cached_account) in accounts {
+        let (Some((account_info, storage)), _) = cached_account.into_components() else {
+            continue;
+        };
+
+        // Process account changes
+        let account = Account {
+            nonce: account_info.nonce,
+            balance: account_info.balance,
+            codehash: (account_info.code_hash != KECCAK_EMPTY).then_some(account_info.code_hash),
+        };
+
+        let account_key = PlainKey::Account(address).encode();
+        let account_value = (!account.is_empty()).then(|| PlainValue::Account(account).encode());
+        kv_updates.insert(account_key, account_value);
+
+        // Process storage changes
+        for (slot, value) in storage {
+            let storage_key = PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
+            let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
+            kv_updates.insert(storage_key, storage_value);
+        }
+    }
 
     // Update the SALT state
     let state_updates = EphemeralSaltState::new(&witness)
@@ -310,6 +338,11 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
+
+    // Check if computed withdrawals root matches the claimed one
+    mpt_witness
+        .verify(&block.header, withdrawal_contract)
+        .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);

@@ -190,6 +190,10 @@ async fn main() -> Result<()> {
                 block.header.number,
                 block.header.hash,
                 block.header.state_root,
+                block
+                    .header
+                    .withdrawals_root
+                    .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
             )
             .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
 
@@ -454,10 +458,11 @@ async fn remote_chain_tracker(
                         let block = client
                             .get_block(BlockId::Number(block_number.into()), true)
                             .await?;
-                        let witness = client
+                        let (salt_witness, mpt_witness) = client
                             .get_witness(block.header.number, block.header.hash)
                             .await?;
-                        db.add_validation_task(&block, &witness)?;
+                        db.add_validation_task(&block, &salt_witness, &mpt_witness)?;
+
                         Ok::<Header, eyre::Error>(block.header)
                     })
                 }),
@@ -566,7 +571,7 @@ async fn validate_one(
     chain_spec: &ChainSpec,
 ) -> Result<bool> {
     match validator_db.get_next_task()? {
-        Some((block, witness)) => {
+        Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
             info!("[Worker {}] Validating block {}", worker_id, block_number);
 
@@ -597,8 +602,9 @@ async fn validate_one(
 
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
+            let pre_withdrawals_root = mpt_witness.storage_root;
             let (success, error_message) =
-                match validate_block(chain_spec, &block, witness, &contracts) {
+                match validate_block(chain_spec, &block, witness, mpt_witness, &contracts) {
                     Ok(()) => {
                         info!("[Worker {worker_id}] Successfully validated block {block_number}");
                         (true, None)
@@ -609,11 +615,16 @@ async fn validate_one(
                     }
                 };
 
+            let block_hash = block.header.hash;
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
                 post_state_root: block.header.state_root,
+                pre_withdrawals_root,
+                post_withdrawals_root: block.header.withdrawals_root.ok_or(eyre::eyre!(
+                    "Withdrawals root not found in block {block_hash}"
+                ))?,
                 block_number,
-                block_hash: block.header.hash,
+                block_hash,
                 success,
                 error_message,
                 completed_at: SystemTime::now(),
@@ -833,13 +844,28 @@ mod tests {
         CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
     };
     use op_alloy_rpc_types::Transaction;
-    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use std::{
         collections::BTreeMap,
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
     };
+    use validator_core::withdrawals::MptWitness;
+
+    /// Serialized witness data for a blockchain block.
+    ///
+    /// Contains all necessary information to verify the state transition
+    /// and execution of a block without requiring the full state.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct WitnessFileContent {
+        /// Hash of operation attributes for execution verification
+        pub op_attributes_hash: B256,
+        /// Parent block hash for chain continuity verification
+        pub parent_hash: BlockHash,
+        /// Cryptographic witness proving state transitions
+        pub salt_witness: SaltWitness,
+    }
 
     /// Maximum response body size for the RPC server.
     /// This is set to 100 MB to accommodate large block data and witness information.
@@ -883,8 +909,11 @@ mod tests {
         /// Ordered block number to hash mapping for number-based lookups
         block_hashes: BTreeMap<u64, BlockHash>,
 
-        /// Witness data indexed by block hash
+        /// Salt Witness data indexed by block hash
         witness_data: HashMap<BlockHash, SaltWitness>,
+
+        /// Mpt Witness data indexed by block hash
+        mpt_witness_data: HashMap<BlockHash, MptWitness>,
 
         /// Contract bytecode cache
         contracts: HashMap<B256, Bytecode>,
@@ -943,13 +972,16 @@ mod tests {
 
         // Set the local chain tip to the first block in test data.
         let (block_num, block_hash) = context.min_block;
-        let state_root = context
+        let block = context
             .blocks_by_hash
             .get(&block_hash)
-            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?
+            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?;
+        let state_root = block.header.state_root;
+        let withdrawals_root = block
             .header
-            .state_root;
-        validator_db.reset_anchor_block(block_num, block_hash, state_root)?;
+            .withdrawals_root
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
+        validator_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root)?;
 
         // Populate CONTRACTS table with test contract bytecode
         let contracts = load_contracts(CONTRACTS_FILE);
@@ -1015,8 +1047,20 @@ mod tests {
                 })?;
 
                 // Look up witness data by block hash
-                context
-                    .witness_data
+                let salt_witness =
+                    context
+                        .witness_data
+                        .get(&block_hash)
+                        .cloned()
+                        .ok_or_else(|| {
+                            make_rpc_error(
+                                CALL_EXECUTION_FAILED_CODE,
+                                format!("Witness for block {hash_str} not found"),
+                            )
+                        })?;
+
+                let mpt_witness = context
+                    .mpt_witness_data
                     .get(&block_hash)
                     .cloned()
                     .ok_or_else(|| {
@@ -1024,7 +1068,9 @@ mod tests {
                             CALL_EXECUTION_FAILED_CODE,
                             format!("Witness for block {hash_str} not found"),
                         )
-                    })
+                    })?;
+
+                Ok::<_, ErrorObject<'static>>((salt_witness, mpt_witness))
             })
             .unwrap();
 
@@ -1110,6 +1156,7 @@ mod tests {
         let mut blocks_by_hash = HashMap::new();
         let mut block_hashes = BTreeMap::new();
         let mut witness_data = HashMap::new();
+        let mut mpt_witness_data = HashMap::new();
 
         // Load block data from TEST_BLOCK_DIR
         info!("Loading block data from {}", TEST_BLOCK_DIR);
@@ -1175,32 +1222,33 @@ mod tests {
             let witness_entries = std::fs::read_dir(&test_witness_dir)
                 .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?;
 
-            let mut witness_count = 0;
             for entry in witness_entries {
                 let entry = entry?;
                 let file_path = entry.path();
-                if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
-                    // Parse filename for block info
-                    let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
-                    let (_, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
+                let Some(ext) = file_path.extension().and_then(|s| s.to_str()) else {
+                    continue;
+                };
 
-                    // Read and deserialize witness file
-                    let file_data = std::fs::read(&file_path)?;
+                let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
+                let (_, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
+                let file_data = std::fs::read(&file_path)?;
 
-                    // Extract and deserialize SaltWitness from file_data
-                    let (salt_witness, _): (SaltWitness, usize) =
-                        bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
-                            .map_err(|e| {
-                                anyhow!(
-                                    "Failed to deserialize SaltWitness from file_data {block_num_and_hash}: {e}"
-                                )
-                            })?;
-
-                    witness_data.insert(block_hash, salt_witness);
-                    witness_count += 1;
+                match ext {
+                    "w" => {
+                        let salt_witness: WitnessFileContent = bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
+                            .map_err(|e| anyhow!("Failed to deserialize SaltWitness from file_data {block_num_and_hash}: {e}"))?.0;
+                        witness_data.insert(block_hash, salt_witness.salt_witness);
+                    }
+                    "mpt" => {
+                        let (mpt_witness, _): (MptWitness, usize) = bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
+                            .map_err(|e| anyhow!("Failed to deserialize MptWitness from file_data {block_num_and_hash}: {e}"))?;
+                        mpt_witness_data.insert(block_hash, mpt_witness);
+                    }
+                    _ => {}
                 }
             }
-            info!("Loaded {} witness files", witness_count);
+            info!("Loaded {} salt witness files", witness_data.len());
+            info!("Loaded {} mpt witness files", mpt_witness_data.len());
         } else {
             info!(
                 "Witness directory {} does not exist, skipping witness data",
@@ -1217,6 +1265,7 @@ mod tests {
             blocks_by_hash,
             block_hashes,
             witness_data,
+            mpt_witness_data,
             contracts,
             min_block,
             max_block,
