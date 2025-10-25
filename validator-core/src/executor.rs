@@ -331,7 +331,7 @@ pub fn validate_block(
 
     // Update the SALT state
     let state_updates = EphemeralSaltState::new(&witness)
-        .update(&kv_updates)
+        .update_fin(&kv_updates)
         .map_err(ValidationError::StateUpdateFailed)?;
 
     // Update the state root
