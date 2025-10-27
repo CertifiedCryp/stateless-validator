@@ -73,8 +73,10 @@ export STATELESS_VALIDATOR_GENESIS_FILE=/path/to/genesis.json
 export STATELESS_VALIDATOR_START_BLOCK=<trusted-block-hash>
 export STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS=false
 
-cargo run --bin stateless-validator
+cargo run --release --bin stateless-validator
 ```
+
+**Note**: Command-line arguments take precedence over environment variables.
 
 ### Getting Started
 
