@@ -1,9 +1,10 @@
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, hex};
-use alloy_rpc_types_eth::{BlockId, Header};
+use alloy_rpc_types_eth::{Block, BlockId};
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::future;
+use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use validator_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
+    withdrawals::MptWitness,
 };
 
 mod rpc;
@@ -110,8 +112,8 @@ impl Default for ChainSyncConfig {
             concurrent_workers: num_cpus::get(),
             sync_poll_interval: Duration::from_secs(1),
             sync_target: None,
-            tracker_lookahead_blocks: 10,
-            tracker_poll_interval: Duration::from_secs(2),
+            tracker_lookahead_blocks: 80,
+            tracker_poll_interval: Duration::from_millis(100),
             pruner_interval: Duration::from_secs(300),
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
@@ -455,21 +457,26 @@ async fn remote_chain_tracker(
                 remote_tip.0 + 1
             );
 
-            // Fetch blocks in parallel and queue validation tasks
-            let headers = future::join_all(
+            // Fetch blocks in parallel
+            let tasks = future::join_all(
                 (remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(|block_number| {
                     let client = client.clone();
-                    let db = validator_db.clone();
                     tokio::spawn(async move {
                         let block = client
-                            .get_block(BlockId::Number(block_number.into()), true)
+                            .get_block(BlockId::Number(block_number.into()), false)
                             .await?;
                         let (salt_witness, mpt_witness) = client
                             .get_witness(block.header.number, block.header.hash)
                             .await?;
-                        db.add_validation_task(&block, &salt_witness, &mpt_witness)?;
+                        let block = client
+                            .get_block(BlockId::Number(block_number.into()), true)
+                            .await?;
 
-                        Ok::<Header, eyre::Error>(block.header)
+                        Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((
+                            block,
+                            salt_witness,
+                            mpt_witness,
+                        ))
                     })
                 }),
             )
@@ -498,11 +505,10 @@ async fn remote_chain_tracker(
             .collect::<Vec<_>>();
 
             // Add successfully fetched headers to remote chain
-            for header in headers {
-                validator_db.grow_remote_chain(&header)?;
-            }
+            validator_db.add_validation_tasks(&tasks)?;
+            validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
-            Ok::<(), eyre::Error>(())
+            Ok(())
         }
         .await
         {
