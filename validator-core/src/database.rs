@@ -20,6 +20,7 @@ use salt::{
     Witness, bucket_id_from_metadata_key,
 };
 use std::collections::HashMap;
+use tracing::trace;
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]
@@ -74,6 +75,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
 
     /// Provides basic account information from the witness
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        trace!(?address, "basic_ref");
+
         let raw_value = self.plain_value(&PlainKey::Account(address).encode())?;
 
         match raw_value.and_then(|v| match PlainValue::decode(&v) {
@@ -98,6 +101,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
 
     /// Provides contract bytecode by its hash
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        trace!(?code_hash, "code_by_hash_ref");
+
         if code_hash == KECCAK_EMPTY {
             return Ok(Bytecode::new_raw(Bytes::new()));
         }
@@ -109,6 +114,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
 
     /// Provides a storage slot's value for a given account
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        trace!(?address, index = %format_args!("{:#x}", index), "storage_ref");
+
         let raw_value = self.plain_value(&PlainKey::Storage(address, index.into()).encode())?;
 
         Ok(raw_value
@@ -138,6 +145,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
     /// - The block number is >= current block number (future blocks)
     /// - The witness data is corrupted or storage lookup fails
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        trace!(number, "block_hash_ref");
+
         // Return error for blocks beyond EIP-2935 history window
         if number >= self.header.number
             || number + (HISTORY_SERVE_WINDOW as u64) < self.header.number
