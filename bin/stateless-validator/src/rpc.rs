@@ -2,13 +2,13 @@
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
-use eyre::{Context, Result, eyre};
+use eyre::{Context, Result, ensure, eyre};
 use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use validator_core::withdrawals::MptWitness;
+use validator_core::{executor::verify_block_integrity, withdrawals::MptWitness};
 
 /// Response from mega_setValidatedBlocks RPC call
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +81,11 @@ impl RpcClient {
 
     /// Gets a block by its identifier with optional transaction details.
     ///
+    /// Performs data integrity checks on the returned block:
+    /// - Verifies block_id matches the returned block
+    /// - Verifies block hash matches the computed hash from header
+    /// - If full transactions: verifies transaction hashes and roots, and signers
+    ///
     /// # Arguments
     /// * `block_id` - Block identifier (number, hash, latest, etc.)
     /// * `full_txs` - If true, includes full transaction objects; if false, only transaction hashes
@@ -89,14 +94,39 @@ impl RpcClient {
     /// Complete block data including header, transactions, and metadata.
     ///
     /// # Errors
-    /// Returns error if block doesn't exist or RPC call fails.
+    /// Returns error if block doesn't exist, RPC call fails, or integrity checks fail.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = if full_txs {
             self.data_provider.get_block(block_id).full().await?
         } else {
             self.data_provider.get_block(block_id).await?
         };
-        block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
+        let block = block.ok_or_else(|| eyre!("Block {:?} not found", block_id))?;
+
+        // Verify block_id matches the returned block
+        match block_id {
+            BlockId::Number(BlockNumberOrTag::Number(num)) => {
+                ensure!(
+                    block.header.number == num,
+                    "Block number mismatch: requested {}, got {}",
+                    num,
+                    block.header.number
+                );
+            }
+            BlockId::Hash(hash) => {
+                ensure!(
+                    block.header.hash == hash.block_hash,
+                    "Block hash mismatch: requested {:?}, got {:?}",
+                    hash.block_hash,
+                    block.header.hash
+                );
+            }
+            _ => {} // Skip for latest, earliest, pending, etc.
+        }
+
+        verify_block_integrity(&block)?;
+
+        Ok(block)
     }
 
     /// Gets the current latest block number from the blockchain.
