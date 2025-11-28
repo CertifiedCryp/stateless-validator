@@ -8,7 +8,7 @@ use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
-use mega_evm::{ExternalEnvs, OracleEnv, SaltEnv};
+use mega_evm::{ExternalEnvFactory, ExternalEnvs, OracleEnv, SaltEnv};
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -17,7 +17,7 @@ use revm::{
 };
 use salt::{
     BucketId, BucketMeta, EphemeralSaltState, METADATA_KEYS_RANGE, SaltKey, SaltValue, SaltWitness,
-    Witness, bucket_id_from_metadata_key,
+    Witness, bucket_id_from_metadata_key, hasher,
 };
 use std::collections::HashMap;
 use tracing::trace;
@@ -218,7 +218,7 @@ impl WitnessExternalEnv {
             .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self {
-            block_number: block_number - 1,
+            block_number,
             bucket_capacities,
         })
     }
@@ -242,35 +242,27 @@ impl WitnessExternalEnv {
     }
 }
 
-impl ExternalEnvs for WitnessExternalEnv {
-    type SaltEnv = Self;
-    type OracleEnv = Self;
+impl ExternalEnvFactory for WitnessExternalEnv {
+    type EnvTypes = (Self, Self);
 
-    fn salt_env(&self) -> Self::SaltEnv {
-        self.clone()
-    }
-
-    fn oracle_env(&self) -> Self::OracleEnv {
-        self.clone()
+    fn external_envs(&self, block: BlockNumber) -> ExternalEnvs<Self::EnvTypes> {
+        assert_eq!(
+            block, self.block_number,
+            "block mismatch: expected {}, got {}",
+            self.block_number, block
+        );
+        ExternalEnvs {
+            salt_env: self.clone(),
+            oracle_env: self.clone(),
+        }
     }
 }
 
 impl SaltEnv for WitnessExternalEnv {
     type Error = WitnessDatabaseError;
 
-    fn get_bucket_capacity(
-        &self,
-        bucket_id: BucketId,
-        at_block: BlockNumber,
-    ) -> Result<u64, Self::Error> {
-        trace!(?bucket_id, at_block, "get_bucket_capacity");
-
-        if at_block != self.block_number {
-            return Err(WitnessDatabaseError(format!(
-                "block mismatch: expected {}, got {}",
-                self.block_number, at_block
-            )));
-        }
+    fn get_bucket_capacity(&self, bucket_id: BucketId) -> Result<u64, Self::Error> {
+        trace!(?bucket_id, "get_bucket_capacity");
 
         self.bucket_capacities
             .get(&bucket_id)
@@ -278,6 +270,14 @@ impl SaltEnv for WitnessExternalEnv {
             .ok_or_else(|| {
                 WitnessDatabaseError(format!("Capacity of bucket {bucket_id} not in witness"))
             })
+    }
+
+    fn bucket_id_for_account(account: Address) -> BucketId {
+        hasher::bucket_id(&PlainKey::Account(account).encode())
+    }
+
+    fn bucket_id_for_slot(address: Address, key: U256) -> BucketId {
+        hasher::bucket_id(&PlainKey::Storage(address, key.into()).encode())
     }
 }
 
