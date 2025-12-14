@@ -57,6 +57,8 @@
 //! - `add_contract_codes()` - Cache contract bytecodes needed during validation in batch
 //! - `get_contract_codes()` - Retrieve cached contract bytecodes by code hashes in batch
 
+use std::{collections::HashMap, fmt};
+
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
@@ -67,10 +69,10 @@ use salt::SaltWitness;
 use serde_json;
 use thiserror::Error;
 
-use std::{collections::HashMap, fmt};
-
-use crate::executor::{ValidationError, ValidationResult};
-use crate::withdrawals::MptWitness;
+use crate::{
+    executor::{ValidationError, ValidationResult},
+    withdrawals::MptWitness,
+};
 
 /// Stores our local view of the canonical chain.
 ///
