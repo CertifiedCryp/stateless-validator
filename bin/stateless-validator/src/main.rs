@@ -25,6 +25,7 @@ use validator_core::{
     withdrawals::MptWitness,
 };
 
+mod metrics;
 mod rpc;
 use rpc::RpcClient;
 
@@ -161,6 +162,10 @@ pub struct ChainSyncConfig {
     pub tracker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
     pub report_validation_results: bool,
+    /// Enable Prometheus metrics endpoint
+    pub metrics_enabled: bool,
+    /// Port for Prometheus metrics HTTP endpoint
+    pub metrics_port: u16,
 }
 
 impl Default for ChainSyncConfig {
@@ -177,6 +182,8 @@ impl Default for ChainSyncConfig {
             worker_error_sleep: Duration::from_millis(1000),
             tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
+            metrics_enabled: false,
+            metrics_port: metrics::DEFAULT_METRICS_PORT,
         }
     }
 }
@@ -210,6 +217,15 @@ struct CommandLineArgs {
     /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
     #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS")]
     report_validation_results: bool,
+
+    /// Enable Prometheus metrics endpoint.
+    /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_ENABLED")]
+    metrics_enabled: bool,
+
+    /// Port for Prometheus metrics HTTP endpoint.
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -223,6 +239,15 @@ async fn main() -> Result<()> {
     info!("[Main] Witness endpoint: {}", args.witness_endpoint);
     if let Some(ref genesis_file) = args.genesis_file {
         info!("[Main] Genesis file: {}", genesis_file);
+    }
+
+    // Initialize metrics if enabled
+    if args.metrics_enabled {
+        let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        metrics::init_metrics(metrics_addr)?;
+        info!("[Main] Metrics enabled on port {}", args.metrics_port);
+    } else {
+        info!("[Main] Metrics disabled");
     }
 
     let work_dir = PathBuf::from(args.data_dir);
@@ -276,6 +301,8 @@ async fn main() -> Result<()> {
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
         report_validation_results: args.report_validation_results,
+        metrics_enabled: args.metrics_enabled,
+        metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
     });
     info!(
@@ -412,6 +439,14 @@ async fn chain_sync(
                 tokio::time::sleep(config.sync_poll_interval).await;
             }
 
+            // Update chain height metrics
+            if let (Ok(Some((local_tip, _))), Ok(remote_tip)) =
+                (validator_db.get_local_tip(), validator_db.get_remote_tip())
+            {
+                let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
+                metrics::set_chain_heights(local_tip, remote_height);
+            }
+
             Ok::<(), eyre::Error>(())
         }
         .await
@@ -497,6 +532,7 @@ async fn remote_chain_tracker(
                     match find_divergence_point(&client, &validator_db, remote_tip.0).await {
                         Ok(rollback_to) => {
                             warn!("[Tracker] Rolling back to block {rollback_to}");
+                            metrics::on_chain_reorg(remote_tip.0.saturating_sub(rollback_to));
                             validator_db.rollback_chain(rollback_to)?;
                             return Ok(());
                         }
@@ -677,15 +713,23 @@ async fn validate_one(
     match validator_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
+            let tx_count = block.transactions.len() as u64;
+            let gas_used = block.header.gas_used;
             debug!("[Worker {}] Validating block {}", worker_id, block_number);
+
+            let start = Instant::now();
 
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
 
             let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
 
-            // Fetch missing contract codes via RPC and update the local DB
-            let codes = client.get_code(&missing_contracts).await?;
+            metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
+
+            // Fetch missing contract codes via RPC concurrently and update the local DB
+            let codes =
+                future::try_join_all(missing_contracts.iter().map(|&hash| client.get_code(hash)))
+                    .await?;
 
             // Validate all fetched bytecodes match expected hashes
             let new_bytecodes: Vec<_> = missing_contracts
@@ -722,9 +766,19 @@ async fn validate_one(
             .await
             .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
 
-            let (success, error_message) = match validation_result {
-                Ok(()) => {
+            let (success, error_message) = match &validation_result {
+                Ok(stats) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                    metrics::on_validation_success(
+                        start.elapsed().as_secs_f64(),
+                        stats.witness_verification_time,
+                        stats.block_replay_time,
+                        stats.salt_update_time,
+                        tx_count,
+                        gas_used,
+                        stats.state_reads,
+                        stats.state_writes,
+                    );
                     (true, None)
                 }
                 Err(e) => {
@@ -732,6 +786,7 @@ async fn validate_one(
                     (false, Some(e.to_string()))
                 }
             };
+            metrics::on_worker_task_done(worker_id, success);
 
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
@@ -851,6 +906,7 @@ async fn history_pruner(
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
+                    metrics::on_blocks_pruned(blocks_pruned);
                 }
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),
                 _ => {}
