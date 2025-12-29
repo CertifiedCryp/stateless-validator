@@ -284,10 +284,18 @@ async fn run() -> Result<()> {
         info!("[Main] Initializing from start block: {}", start_block_str);
 
         let block_hash = parse_block_hash(start_block_str)?;
-        let block = client
-            .get_block(BlockId::Hash(block_hash.into()), false)
-            .await
-            .map_err(|e| anyhow!("Failed to fetch block {}: {}", block_hash, e))?;
+        let block = loop {
+            match client
+                .get_block(BlockId::Hash(block_hash.into()), false)
+                .await
+            {
+                Ok(block) => break block,
+                Err(e) => {
+                    warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
 
         validator_db
             .reset_anchor_block(
