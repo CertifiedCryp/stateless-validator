@@ -63,6 +63,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
 use op_alloy_rpc_types::Transaction;
+use rayon::prelude::*;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
@@ -221,6 +222,16 @@ pub enum ValidationDbError {
     FailedValidation(String),
 
     #[error(
+        "validation result mismatch: remote=({expected_block_number}, {expected_block_hash:?}) result=({actual_block_number}, {actual_block_hash:?})"
+    )]
+    ValidationResultMismatch {
+        expected_block_number: BlockNumber,
+        expected_block_hash: BlockHash,
+        actual_block_number: BlockNumber,
+        actual_block_hash: BlockHash,
+    },
+
+    #[error(
         "block {block_number} must extend parent block with hash {expected_parent_hash:?}, found {actual_parent_hash:?}"
     )]
     InvalidChainExtension {
@@ -341,6 +352,23 @@ impl ValidatorDB {
         &self,
         tasks: &[(Block<Transaction>, SaltWitness, MptWitness)],
     ) -> ValidationDbResult<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let tasks = tasks
+            .par_iter()
+            .map(|(block, salt_witness, mpt_witness)| {
+                Ok::<_, ValidationDbError>((
+                    block.header.number,
+                    block.header.hash.0,
+                    encode_block_to_vec(block)?,
+                    encode_to_vec(salt_witness)?,
+                    encode_to_vec(mpt_witness)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut task_list = write_txn.open_table(TASK_LIST)?;
@@ -349,19 +377,16 @@ impl ValidatorDB {
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
 
-            for (block, salt_witness, mpt_witness) in tasks {
-                let block_number = block.header.number;
-                let block_hash = block.header.hash.0;
-
+            for (number, hash, block, salt_witness, mpt_witness) in tasks {
                 // Adds the block to the validation task queue (TASK_LIST)
-                task_list.insert((block_number, block_hash), ())?;
+                task_list.insert((number, hash), ())?;
                 // Stores the complete block data for worker access (BLOCK_DATA)
-                block_data.insert(block_hash, encode_block_to_vec(block)?)?;
+                block_data.insert(hash, block)?;
                 // ... and the witness data (WITNESSES and MPT_WITNESSES)
-                witnesses.insert(block_hash, encode_to_vec(salt_witness)?)?;
-                mpt_witnesses.insert(block_hash, encode_to_vec(mpt_witness)?)?;
+                witnesses.insert(hash, salt_witness)?;
+                mpt_witnesses.insert(hash, mpt_witness)?;
                 // Records the block in the block registry (BLOCK_RECORDS)
-                block_records.insert((block_number, block_hash), ())?;
+                block_records.insert((number, hash), ())?;
             }
         }
         write_txn.commit()?;
@@ -374,16 +399,21 @@ impl ValidatorDB {
     /// so future validations can retrieve it via get_contract_codes() instead
     /// of fetching externally. The code hash is computed automatically from
     /// the bytecode to ensure data integrity.
-    pub fn add_contract_codes<'a>(
-        &self,
-        bytecodes: impl IntoIterator<Item = &'a Bytecode>,
-    ) -> ValidationDbResult<()> {
+    pub fn add_contract_codes(&self, bytecodes: &[(B256, Bytecode)]) -> ValidationDbResult<()> {
+        if bytecodes.is_empty() {
+            return Ok(());
+        }
+        let bytecodes = bytecodes
+            .par_iter()
+            .map(|(code_hash, bytecode)| {
+                Ok::<_, ValidationDbError>((code_hash, encode_to_vec(bytecode)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut contracts = write_txn.open_table(CONTRACTS)?;
-            for bytecode in bytecodes {
-                let code_hash = bytecode.hash_slow();
-                let serialized_bytecode = encode_to_vec(bytecode)?;
+            for (code_hash, serialized_bytecode) in bytecodes {
                 contracts.insert(code_hash.0, serialized_bytecode)?;
             }
         }
@@ -403,11 +433,11 @@ impl ValidatorDB {
     /// * `Ok(())` - Genesis successfully stored
     /// * `Err(ValidationDbError)` - Database or serialization error
     pub fn store_genesis(&self, genesis: &Genesis) -> ValidationDbResult<()> {
+        let serialized_genesis = serde_json::to_vec(genesis).map_err(SerializationError::Json)?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut genesis_table = write_txn.open_table(GENESIS_CONFIG)?;
-            let serialized_genesis =
-                serde_json::to_vec(genesis).map_err(SerializationError::Json)?;
             genesis_table.insert("genesis", serialized_genesis)?;
         }
         write_txn.commit()?;
@@ -458,34 +488,37 @@ impl ValidatorDB {
     ///
     /// Returns `Ok(true)` if a block was advanced, `Ok(false)` if no work to do.
     pub fn grow_local_chain(&self) -> ValidationDbResult<bool> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-            let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            let block_data = write_txn.open_table(BLOCK_DATA)?;
+        // Read phase: gather all information and perform validations before acquiring write lock
+        let validated_block = {
+            let read_txn = self.database.begin_read()?;
+            let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
+            let validation_results = read_txn.open_table(VALIDATION_RESULTS)?;
+            let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
-            // Get and validate first remote block
-            let (block_number, block_hash_bytes) = match remote_chain.first()? {
-                Some(entry) => (entry.0.value(), entry.1.value()),
-                None => return Ok(false),
+            // Get first block from remote chain
+            let Some(first_entry) = remote_chain.first()? else {
+                return Ok(false);
             };
+            let block_number = first_entry.0.value();
+            let block_hash_bytes = first_entry.1.value();
 
-            // Load block header and verify it matches remote chain entry
-            let serialized_block = block_data
-                .get(block_hash_bytes)?
-                .expect("block data must exist for blocks in remote chain");
-            let header = decode_block_from_slice(&serialized_block.value()).header;
-
-            assert_eq!(header.number, block_number);
-            assert_eq!(header.hash.0, block_hash_bytes);
-
-            // Ensure block validation succeeded
-            let result: ValidationResult = match validation_results.get(block_hash_bytes)? {
-                Some(serialized) => decode_from_slice(&serialized.value()),
-                None => return Ok(false), // Validation not complete yet
+            // Check if validation result exists
+            let Some(serialized) = validation_results.get(block_hash_bytes)? else {
+                return Ok(false);
             };
+            let result: ValidationResult = decode_from_slice(&serialized.value());
 
+            // Verify validation result matches the remote block
+            if result.block_number != block_number || result.block_hash.0 != block_hash_bytes {
+                return Err(ValidationDbError::ValidationResultMismatch {
+                    expected_block_number: block_number,
+                    expected_block_hash: BlockHash::from(block_hash_bytes),
+                    actual_block_number: result.block_number,
+                    actual_block_hash: result.block_hash,
+                });
+            }
+
+            // Ensure validation succeeded
             if !result.success {
                 return Err(ValidationDbError::FailedValidation(
                     result.error_message.unwrap_or_else(|| {
@@ -495,14 +528,13 @@ impl ValidatorDB {
             }
 
             // Verify parent chain extension for non-genesis blocks
-            if header.number > 0 {
-                let (parent_post_state, parent_post_withdrawals) = {
-                    let parent_value = canonical_chain
-                        .get(header.number - 1)?
-                        .expect("parent block must exist in canonical chain")
-                        .value();
-                    (B256::from(parent_value.1), B256::from(parent_value.2))
-                };
+            if block_number > 0 {
+                let parent_value = canonical_chain
+                    .get(block_number - 1)?
+                    .expect("parent block must exist in canonical chain")
+                    .value();
+                let parent_post_state = B256::from(parent_value.1);
+                let parent_post_withdrawals = B256::from(parent_value.2);
 
                 if result.pre_state_root != parent_post_state {
                     return Err(ValidationDbError::FailedValidation(
@@ -525,16 +557,30 @@ impl ValidatorDB {
                 }
             }
 
+            // All validations passed - return the data needed for the write phase
+            (
+                block_number,
+                block_hash_bytes,
+                result.post_state_root.0,
+                result.post_withdrawals_root.0,
+            )
+        };
+
+        // Write phase: only acquire write lock after confirming growth is valid
+        let (block_number, block_hash_bytes, post_state_root, post_withdrawals_root) =
+            validated_block;
+
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+
             // Move block from remote to canonical chain
             canonical_chain.insert(
-                header.number,
-                (
-                    header.hash.0,
-                    result.post_state_root.0,
-                    result.post_withdrawals_root.0,
-                ),
+                block_number,
+                (block_hash_bytes, post_state_root, post_withdrawals_root),
             )?;
-            remote_chain.remove(header.number)?;
+            remote_chain.remove(block_number)?;
         }
         write_txn.commit()?;
         Ok(true)
@@ -629,15 +675,18 @@ impl ValidatorDB {
     /// Called by workers when they finish validating a block. Stores the validation
     /// result and marks the task as complete.
     pub fn complete_validation(&self, result: ValidationResult) -> ValidationDbResult<()> {
+        let block_number = result.block_number;
+        let block_hash = result.block_hash.0;
+        let serialized_result = encode_to_vec(&result)?;
         let write_txn = self.database.begin_write()?;
         {
             // Store validation result
             let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            validation_results.insert(result.block_hash.0, encode_to_vec(&result)?)?;
+            validation_results.insert(block_hash, serialized_result)?;
 
             // Remove from ongoing tasks
             let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            ongoing_tasks.remove((result.block_number, result.block_hash.0))?;
+            ongoing_tasks.remove((block_number, block_hash))?;
         }
         write_txn.commit()?;
         Ok(())
@@ -669,14 +718,12 @@ impl ValidatorDB {
     pub fn get_next_task(
         &self,
     ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
-        let write_txn = self.database.begin_write()?;
+        // Read phase: find the candidate task to claim and capture its key
+        let candidate_task = {
+            let read_txn = self.database.begin_read()?;
+            let task_list = read_txn.open_table(TASK_LIST)?;
+            let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
-        let result = {
-            let mut task_list = write_txn.open_table(TASK_LIST)?;
-            let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            // Get first task that's ahead of canonical tip using range query
             let range_start = match canonical_chain.last()? {
                 Some((canonical_key, _)) => {
                     let tip_block = canonical_key.value();
@@ -685,63 +732,98 @@ impl ValidatorDB {
                 None => (0u64, [0u8; 32]),
             };
 
-            // Find first valid task
-            let next_task = task_list
+            task_list
                 .range(range_start..)?
                 .next()
                 .transpose()?
-                .map(|(task_key, _)| task_key.value());
-
-            match next_task {
-                Some(block_num_hash) => {
-                    let (_, block_hash_bytes) = block_num_hash;
-                    let block_hash = BlockHash::from(block_hash_bytes);
-
-                    // Move task to ongoing
-                    task_list.remove(block_num_hash)?;
-                    ongoing_tasks.insert(block_num_hash, ())?;
-
-                    // Load block data and witness
-                    let block_data = write_txn.open_table(BLOCK_DATA)?;
-                    let witnesses = write_txn.open_table(WITNESSES)?;
-                    let mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-
-                    let block = decode_block_from_slice(
-                        &block_data
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::BlockData,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-                    let witness = decode_from_slice(
-                        &witnesses
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::Witness,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-                    let mpt_witness = decode_from_slice(
-                        &mpt_witnesses
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::MptWitness,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-
-                    Some((block, witness, mpt_witness))
-                }
-                None => None,
-            }
+                .map(|(task_key, _)| task_key.value())
         };
 
-        write_txn.commit()?;
-        Ok(result)
+        let Some(task_key) = candidate_task else {
+            return Ok(None);
+        };
+
+        // Write phase: atomically claim the task with minimal operations
+        let claimed = {
+            let write_txn = self.database.begin_write()?;
+            let claimed = {
+                let mut task_list = write_txn.open_table(TASK_LIST)?;
+                let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+
+                // Atomically move task from pending to ongoing
+                // If task was already claimed by another worker, remove returns None
+                if task_list.remove(task_key)?.is_some() {
+                    ongoing_tasks.insert(task_key, ())?;
+                    true
+                } else {
+                    false
+                }
+            };
+            write_txn.commit()?;
+            claimed
+        };
+
+        if !claimed {
+            // Another worker claimed this task between read and write phase
+            return Ok(None);
+        }
+
+        let (block_number, block_hash_bytes) = task_key;
+
+        // Read phase: load all data outside of write lock
+        let read_txn = self.database.begin_read()?;
+        let block_data = read_txn.open_table(BLOCK_DATA)?;
+        let witnesses = read_txn.open_table(WITNESSES)?;
+        let mpt_witnesses = read_txn.open_table(MPT_WITNESSES)?;
+
+        let block_hash = BlockHash::from(block_hash_bytes);
+        let load_result = (|| -> ValidationDbResult<_> {
+            let block = decode_block_from_slice(
+                &block_data
+                    .get(block_hash_bytes)?
+                    .ok_or(ValidationDbError::MissingData {
+                        kind: MissingDataKind::BlockData,
+                        block_hash,
+                    })?
+                    .value(),
+            );
+            let witness = decode_from_slice(
+                &witnesses
+                    .get(block_hash_bytes)?
+                    .ok_or(ValidationDbError::MissingData {
+                        kind: MissingDataKind::Witness,
+                        block_hash,
+                    })?
+                    .value(),
+            );
+            let mpt_witness = decode_from_slice(
+                &mpt_witnesses
+                    .get(block_hash_bytes)?
+                    .ok_or(ValidationDbError::MissingData {
+                        kind: MissingDataKind::MptWitness,
+                        block_hash,
+                    })?
+                    .value(),
+            );
+
+            Ok(Some((block, witness, mpt_witness)))
+        })();
+
+        match load_result {
+            Ok(task) => Ok(task),
+            Err(err) => {
+                // Error recovery: move task back to pending queue
+                let write_txn = self.database.begin_write()?;
+                {
+                    let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+                    let mut task_list = write_txn.open_table(TASK_LIST)?;
+                    ongoing_tasks.remove((block_number, block_hash_bytes))?;
+                    task_list.insert((block_number, block_hash_bytes), ())?;
+                }
+                write_txn.commit()?;
+                Err(err)
+            }
+        }
     }
 
     /// Retrieves the validation result for a block
@@ -859,22 +941,24 @@ impl ValidatorDB {
     ///
     /// Returns the number of blocks that were actually pruned.
     pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
+        let read_txn = self.database.begin_read()?;
+        let block_records = read_txn.open_table(BLOCK_RECORDS)?;
+
+        // Collect keys to remove (blocks older than before_block)
+        let keys_to_remove = block_records
+            .range(..(before_block, [0u8; 32]))?
+            .map(|result| result.map(|(key, _)| key.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pruned_count = keys_to_remove.len() as u64;
+
         let write_txn = self.database.begin_write()?;
-        let blocks_pruned = {
+        {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-
-            // Collect keys to remove (blocks older than before_block)
-            let keys_to_remove = block_records
-                .range(..(before_block, [0u8; 32]))?
-                .map(|result| result.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
                 // Remove from all relevant tables
@@ -885,11 +969,9 @@ impl ValidatorDB {
                 mpt_witnesses.remove(block_hash)?;
                 validation_results.remove(block_hash)?;
             }
-
-            pruned_count
-        };
+        }
         write_txn.commit()?;
-        Ok(blocks_pruned)
+        Ok(pruned_count)
     }
 
     /// Recovers tasks that were interrupted by a crash
