@@ -12,7 +12,7 @@ use eyre::{Result, ensure};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::RpcClient;
+use stateless_common::{CodeFetchError, RpcClient};
 use stateless_core::{
     chain_spec::ChainSpec,
     data_types::iter_code_hashes,
@@ -39,13 +39,11 @@ impl BlockFetcher for ValidatorFetcher {
 
     async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
-        // Once we have the hash, fetch the witness and the full block concurrently — they
-        // hit independent upstreams (witness providers vs. data providers) and both retry
-        // internally, so `tokio::join!` just overlaps the two round-trips. Matches the
-        // pattern used by `DataProvider::do_fetch_block_data` in the trace server.
+        // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
+        // surfaces as a hash mismatch rather than silently swapping the block under us.
         let ((salt_witness, mpt_witness), block) = tokio::join!(
             self.rpc_client.get_witness(block_number, block_hash),
-            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+            self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
@@ -190,10 +188,10 @@ impl BlockProcessor for ValidatorProcessor {
             // The `Deadline` variant can't surface here because no deadline is passed.
             let fetched =
                 self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
-                    stateless_common::CodeFetchError::VerificationFailure { .. } => {
+                    CodeFetchError::VerificationFailure { .. } => {
                         fail(format!("Contract verification failed: {e}"), false)
                     }
-                    stateless_common::CodeFetchError::Deadline(_) => {
+                    CodeFetchError::Deadline(_) => {
                         unreachable!("unbounded get_codes cannot produce a deadline error: {e}")
                     }
                 })?;

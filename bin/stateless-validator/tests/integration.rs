@@ -196,6 +196,17 @@ fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
     ErrorObject::owned(code, msg, None::<()>)
 }
 
+fn shape_block(
+    block: &Block<op_alloy_rpc_types::Transaction>,
+    full_block: bool,
+) -> Block<op_alloy_rpc_types::Transaction> {
+    let mut out = block.clone();
+    if !full_block {
+        out.transactions = out.transactions.into_hashes();
+    }
+    out
+}
+
 /// Create a temporary ValidatorDB with the anchor set to the first block in test data.
 ///
 /// The returned `TempDir` must be held by the caller for the test's lifetime —
@@ -230,7 +241,9 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("eth_getBlockByNumber", |params, ctx, _| {
-            let (hex_number, full_block): (String, bool) = params.parse().unwrap();
+            let (hex_number, full_block): (String, bool) = params
+                .parse()
+                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
             let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
 
             let block = ctx
@@ -245,12 +258,22 @@ async fn setup_mock_rpc_server(
                     )
                 })?;
 
-            let result_block = if full_block {
-                block.clone()
-            } else {
-                Block { transactions: block.transactions.clone().into_hashes(), ..block.clone() }
-            };
-            Ok::<_, ErrorObject<'static>>(result_block)
+            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+        })
+        .unwrap();
+
+    module
+        .register_method("eth_getBlockByHash", |params, ctx, _| {
+            let (hash, full_block): (B256, bool) = params
+                .parse()
+                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+
+            let block_hash = BlockHash::from(hash.0);
+            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
+                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+            })?;
+
+            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
         })
         .unwrap();
 
