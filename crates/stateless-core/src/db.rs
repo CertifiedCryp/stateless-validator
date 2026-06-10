@@ -1,24 +1,22 @@
-//! Abstract persistence traits and data types for stateless validation.
+//! Abstract persistence traits and data types — the **shared** storage contract every embedder
+//! relies on. Only genuinely-common traits live here:
+//! - [`ContractStore`]: Contract bytecode persistence (wrapped by the shared `ContractCache`).
+//! - [`ChainStore`]: Chain-cursor management the pipeline drives on every scenario.
 //!
-//! Defines the public API contract used by both binaries:
-//! - [`ContractStore`]: Contract bytecode persistence
-//! - [`GenesisStore`]: Genesis configuration persistence
-//! - [`ChainStore`]: Core chain state management (shared by both binaries)
-//! - [`BlockStore`]: Block/witness storage extension (debug-trace-server only)
+//! Scenario-specific storage is implemented directly in the owning binary, NOT abstracted here:
+//! genesis persistence (stateless-validator), block/witness storage + history pruning
+//! (debug-trace-server), and reorg-floor resolution (mega-reth FullNode, via the pipeline's
+//! [`ReorgResolver`](crate::pipeline::ReorgResolver) seam). The bisection contract for
+//! history-owning stores is [`DivergenceLookups`](crate::pipeline::DivergenceLookups).
 //!
 //! Concrete implementations live in their respective binaries;
 //! shared redb helpers live in the `stateless-db` crate.
 
 use std::{boxed::Box, fmt, string::String, sync::Arc, vec::Vec};
 
-use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
-use alloy_rpc_types_eth::Block;
-use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use thiserror::Error;
-
-use crate::LightWitness;
 
 /// Represents a point on the chain with its state roots.
 ///
@@ -34,7 +32,7 @@ pub struct BlockMeta {
 /// Errors returned by persistence trait methods.
 ///
 /// This is the single typed error at the library/binary boundary: every
-/// [`ChainStore`] / [`BlockStore`] / … method returns `Result<_, StoreError>`.
+/// [`ChainStore`] / … method returns `Result<_, StoreError>`.
 /// Binary code converts to `eyre::Report` automatically via `?`.
 ///
 /// Backend errors (redb, bincode, serde_json, lz4, …) are wrapped as an opaque
@@ -100,38 +98,24 @@ pub trait ContractStore: Send + Sync {
     fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()>;
 }
 
-/// Genesis configuration persistence.
-pub trait GenesisStore: Send + Sync {
-    fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()>;
-    fn load_genesis(&self) -> StoreResult<Option<Genesis>>;
-}
-
-/// Core chain state management (shared by both binaries).
+/// Chain-cursor management — the storage surface the pipeline drives on **every** scenario.
+///
+/// Holds only operations the generic pipeline calls directly: read the tip/anchor, append a
+/// validated batch, read a block hash (for reorg reporting), roll back, and reset to
+/// an anchor (stale-reset path). How a reorg *floor* is decided is NOT here — that's the
+/// pipeline's [`ReorgResolver`](crate::pipeline::ReorgResolver) seam, which each scenario supplies.
+/// History-owning stores additionally implement
+/// [`DivergenceLookups`](crate::pipeline::DivergenceLookups) so the pipeline can bisect them.
 pub trait ChainStore: ContractStore {
     fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>>;
     fn get_anchor(&self) -> StoreResult<Option<BlockMeta>>;
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()>;
     fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
-    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()>;
+    /// Reset anchor + tip to `anchor`. Called by the pipeline only on the stale-reset path
+    /// (enabled via `PipelineConfig::stale_reset_threshold`); a trivial cursor write for stores
+    /// that don't use it.
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()>;
-}
-
-/// History pruning (debug-trace-server only, where explicit pruning is needed).
-///
-/// `ValidatorDB` does not implement this because it uses inline pruning
-/// in [`ChainStore::advance_chain`] instead.
-pub trait PrunableChainStore: ChainStore {
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64>;
-}
-
-/// Block/witness storage extension (debug-trace-server only).
-pub trait BlockStore: PrunableChainStore {
-    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
-    fn get_block_and_witness(
-        &self,
-        block_hash: BlockHash,
-    ) -> StoreResult<(Block<Transaction>, LightWitness)>;
 }
 
 #[cfg(test)]

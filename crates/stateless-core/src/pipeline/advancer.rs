@@ -11,17 +11,76 @@ use crate::{
     db::BlockMeta,
     pipeline::{
         config::{ErrorAction, PipelineOutcome, ReorgEvent, WorkerResult},
-        divergence::find_divergence_point,
+        divergence::{DivergenceLookups, find_divergence_point},
         traits::{BlockFetcher, PipelineHooks, ProcessedBlock},
     },
 };
 
+/// Outcome of a [`ReorgResolver::resolve`] call: the rollback floor, or a reason the cycle must
+/// end without rolling back.
+#[derive(Debug, Clone)]
+pub enum ReorgResolution {
+    /// Roll back to this block (inclusive — it stays), then restart the cycle.
+    Floor(u64),
+    /// Deterministic failure — halt the pipeline (no point retrying).
+    Fatal(String),
+    /// Transient failure — sleep and restart the cycle.
+    Retry(String),
+}
+
+/// The pipeline's reorg seam: given a detected parent-hash mismatch, decide the rollback floor.
+///
+/// This is the single shared abstraction over the scenarios' different reorg models. Each scenario
+/// supplies the resolver matching how it maintains its chain, and passes it to
+/// [`run_pipeline`](crate::pipeline::run_pipeline):
+/// - History-owning scenarios (standalone validator, debug-trace-server) use the core
+///   [`BisectResolver`], which walks their [`DivergenceLookups`] against the remote fetcher.
+/// - The mega-reth FullNode implements this trait in its own bin, returning the floor its host
+///   (state-sync) already published — it never bisects and never touches the fetcher.
+pub trait ReorgResolver<F, S>: Send + Sync {
+    /// Resolve the rollback floor for the reorg the advancer just detected. `persisted_tip` is
+    /// the highest block durably written by `advance_chain` (the upper bound a bisection may read
+    /// from the store).
+    ///
+    /// Desugared to `impl Future + Send` (rather than `async fn`) so the returned future carries a
+    /// `Send` bound — the pipeline drives it on a multi-threaded runtime.
+    fn resolve(
+        &self,
+        fetcher: &F,
+        store: &S,
+        persisted_tip: u64,
+    ) -> impl core::future::Future<Output = Result<ReorgResolution>> + Send;
+}
+
+/// Bisection resolver for history-owning stores: walks local history against the remote via
+/// [`find_divergence_point`]. Requires `S: DivergenceLookups`. Lives in core because both
+/// history-owning scenarios reuse it verbatim over the shared `find_divergence_point` algorithm.
+pub struct BisectResolver;
+
+impl<F, S> ReorgResolver<F, S> for BisectResolver
+where
+    F: BlockFetcher,
+    S: DivergenceLookups + Send + Sync,
+{
+    async fn resolve(&self, fetcher: &F, store: &S, persisted_tip: u64) -> Result<ReorgResolution> {
+        match find_divergence_point(fetcher, store, persisted_tip).await {
+            Ok(v) => Ok(ReorgResolution::Floor(v)),
+            Err(e) if e.is_fatal() => Ok(ReorgResolution::Fatal(e.to_string())),
+            // A non-fatal divergence error is a transport hiccup during the bisection fetches —
+            // an *intentional* transient signal, so route it through `Retry` (warn + sleep +
+            // restart) instead of leaking an `Err` the outer loop logs as "unexpected error".
+            Err(e) => Ok(ReorgResolution::Retry(e.to_string())),
+        }
+    }
+}
+
 /// Receives processed blocks, reorders, verifies parent-hash continuity,
 /// and advances the canonical chain.
-pub(crate) async fn chain_advancer<F, S, H>(
+pub(crate) async fn chain_advancer<F, S, H, R>(
     fetcher: &F,
     store: &S,
     hooks: &H,
+    resolver: &R,
     result_rx: kanal::Receiver<WorkerResult<H::Output>>,
     initial_tip: BlockMeta,
     shutdown: CancellationToken,
@@ -30,6 +89,7 @@ where
     F: BlockFetcher,
     S: ChainStore,
     H: PipelineHooks,
+    R: ReorgResolver<F, S>,
 {
     let rx = result_rx.to_async();
     let mut next_expected = initial_tip.block_number + 1;
@@ -77,12 +137,15 @@ where
                     "Parent hash mismatch — reorg detected"
                 );
 
-                let rollback_to = match find_divergence_point(fetcher, store, persisted_tip).await {
-                    Ok(v) => v,
-                    Err(e) if e.is_fatal() => {
-                        return Ok(PipelineOutcome::Fatal(e.to_string()));
+                // Strategy is scenario-supplied (see `ReorgResolver`); `Floor` rolls back,
+                // `Fatal`/`Retry` end the cycle.
+                let rollback_to = match resolver.resolve(fetcher, store, persisted_tip).await? {
+                    ReorgResolution::Floor(floor) => {
+                        debug!(block = next_expected, floor, "Resolved reorg floor");
+                        floor
                     }
-                    Err(e) => return Err(e.into()),
+                    ReorgResolution::Fatal(msg) => return Ok(PipelineOutcome::Fatal(msg)),
+                    ReorgResolution::Retry(msg) => return Ok(PipelineOutcome::Retry(msg)),
                 };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);

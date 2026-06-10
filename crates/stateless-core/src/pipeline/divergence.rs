@@ -4,30 +4,22 @@ use alloy_primitives::{BlockHash, BlockNumber};
 use tracing::{debug, instrument};
 
 use crate::{
-    ChainStore,
     db::{StoreError, StoreResult},
     pipeline::traits::BlockFetcher,
 };
 
-/// Minimal lookup surface that [`find_divergence_point`] needs from the local chain store.
+/// The bisection contract: the lookup surface a history-owning store exposes so the pipeline can
+/// locate a reorg fork by walking local history against the remote.
 ///
-/// Extracted from `ChainStore` so tests can implement a lightweight in-memory backend
-/// without having to stub every `ChainStore` method. Every `ChainStore` blanket-implements
-/// this trait automatically.
+/// Implemented directly by the stores that own a per-block chain (the standalone validator's
+/// `ValidatorDB`, the debug-trace-server's `ServerDB`); stores with no local history resolve the
+/// reorg floor via the [`ReorgResolver`](crate::pipeline::ReorgResolver) seam instead. Kept minimal
+/// (two reads) so the `find_divergence_point` unit tests can supply a tiny in-memory mock.
 pub trait DivergenceLookups {
     /// Hash for the block at `block_number`, or `None` if it's not in local history.
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
     /// The oldest (lowest-number, highest-depth) block still in local history.
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
-}
-
-impl<S: ChainStore + ?Sized> DivergenceLookups for S {
-    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        ChainStore::get_block_hash(self, block_number)
-    }
-    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        ChainStore::get_earliest_block(self)
-    }
 }
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.
@@ -77,9 +69,8 @@ impl DivergenceError {
 /// Finds where the local chain diverges from the remote.
 ///
 /// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
-/// Backend-agnostic: takes a [`DivergenceLookups`] for local chain reads (implemented
-/// automatically for every [`ChainStore`]); remote reads go through the
-/// `BlockFetcher`'s `eyre::Result`. [`DivergenceError`] wraps both.
+/// Backend-agnostic: takes a [`DivergenceLookups`] for local chain reads; remote reads go
+/// through the `BlockFetcher`'s `eyre::Result`. [`DivergenceError`] wraps both.
 #[instrument(skip_all, fields(mismatch_block), name = "find_divergence")]
 pub async fn find_divergence_point<F, L>(
     fetcher: &F,

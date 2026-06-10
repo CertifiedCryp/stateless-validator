@@ -9,7 +9,7 @@
 //! - [`chain_spec`]: Chain specification and hardfork activation
 //! - [`light_witness`]: Fast witness deserialization (skips proof validation)
 //! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
-//! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
+//! - [`db`]: Shared storage traits (`ChainStore`, `ContractStore`); scenario stores are bin-local
 //! - [`data_types`]: SALT key/value encoding utilities
 //! - [`executor`]: Block validation via EVM replay
 //! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance) — requires
@@ -28,18 +28,18 @@ pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
 pub use db::{
-    BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, MissingDataKind,
-    PrunableChainStore, StoreError, StoreResult, StoreResultExt,
+    BlockMeta, ChainStore, ContractStore, MissingDataKind, StoreError, StoreResult, StoreResultExt,
 };
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
-pub use executor::{ValidationError, ValidationStats, replay_block, validate_block};
+pub use executor::{BlockInput, ValidationError, ValidationStats, replay_block, validate_block};
 #[cfg(feature = "std")]
 pub mod pipeline;
 #[cfg(feature = "std")]
 pub use pipeline::{
-    BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
-    ProcessedBlock, ReorgEvent, block_fetcher, find_divergence_point, run_pipeline,
+    BisectResolver, BlockFetcher, BlockProcessor, DivergenceLookups, ErrorAction, PipelineConfig,
+    PipelineHooks, PipelineOutcome, ProcessedBlock, ReorgEvent, ReorgResolution, ReorgResolver,
+    block_fetcher, find_divergence_point, run_pipeline,
 };
 pub mod withdrawals;

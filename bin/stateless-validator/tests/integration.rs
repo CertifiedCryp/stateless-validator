@@ -17,18 +17,17 @@ use jsonrpsee_types::error::{
 };
 use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    ChainStore, ContractStore, PipelineConfig, db::BlockMeta, pipeline::run_pipeline,
-    withdrawals::MptWitness,
+    BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
+    pipeline::run_pipeline, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use stateless_test_utils::fixtures::TestFixtures;
+use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
     ValidatorProcessor, load_or_create_chain_spec,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use tracing_subscriber::EnvFilter;
 
 /// Argv prefix for tests that exercise an *optional* flag — both required endpoints are
 /// already supplied so the parse only depends on the flag under test.
@@ -171,24 +170,11 @@ impl MockServerState {
     fn new(fixtures: TestFixtures) -> Self {
         let mpt_witnesses = fixtures
             .mpt_witness_bytes
-            .iter()
-            .map(|(hash, bytes)| {
-                let (w, _): (MptWitness, _) =
-                    bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-                        .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
-                (*hash, w)
-            })
+            .keys()
+            .map(|hash| (*hash, fixtures.mpt_witness(hash)))
             .collect();
         Self { fixtures, mpt_witnesses }
     }
-}
-
-fn init_test_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
-        )
-        .try_init();
 }
 
 fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
@@ -381,7 +367,7 @@ async fn setup_mock_rpc_server(
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
 #[tokio::test]
 async fn integration_test() {
-    init_test_logging();
+    let _logging = init_test_logging("stateless_validator");
     debug!("=== Loading Synthetic Test Data ===");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
@@ -411,9 +397,17 @@ async fn integration_test() {
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
-    run_pipeline(fetcher, Arc::clone(&validator_db), processor, hooks, config, shutdown)
-        .await
-        .unwrap();
+    run_pipeline(
+        fetcher,
+        Arc::clone(&validator_db),
+        processor,
+        hooks,
+        config,
+        shutdown,
+        BisectResolver,
+    )
+    .await
+    .unwrap();
 
     // Verify all fixture blocks were validated and persisted — guards against silent
     // partial-advance failures where the pipeline returns Ok but the DB is short.
