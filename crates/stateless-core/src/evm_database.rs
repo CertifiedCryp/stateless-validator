@@ -7,7 +7,6 @@
 use std::{
     format,
     string::{String, ToString},
-    sync::Arc,
     vec::Vec,
 };
 
@@ -67,10 +66,11 @@ pub struct WitnessDatabase<'a, W> {
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: &'a W,
     /// Contract bytecode cache, pre-populated before execution starts.
-    /// Values are `Arc<Bytecode>` so the cache and any cloned `BlockData` share a
-    /// single allocation; revm's trait still demands an owned `Bytecode`, so the
-    /// `DatabaseRef` impls deref-clone at the read boundary.
-    pub contracts: &'a HashMap<B256, Arc<Bytecode>>,
+    /// Values are plain `Bytecode`, which is already internally reference-counted, so the cache
+    /// and any cloned `BlockData` share one allocation without an outer `Arc`. revm's trait
+    /// demands an owned `Bytecode`, so the `DatabaseRef` impls clone (a cheap refcount bump) at
+    /// the read boundary.
+    pub contracts: &'a HashMap<B256, Bytecode>,
 }
 
 impl<'a, W> WitnessDatabase<'a, W>
@@ -104,10 +104,7 @@ where
             _ => None,
         }) {
             Some(acc) => {
-                let code = acc
-                    .codehash
-                    .and_then(|hash| self.contracts.get(&hash))
-                    .map(|arc| (**arc).clone());
+                let code = acc.codehash.and_then(|hash| self.contracts.get(&hash)).cloned();
                 Ok(Some(AccountInfo {
                     balance: acc.balance,
                     nonce: acc.nonce,
@@ -128,7 +125,7 @@ where
         }
         self.contracts
             .get(&code_hash)
-            .map(|arc| (**arc).clone())
+            .cloned()
             .ok_or_else(|| WitnessDatabaseError("Code not found".to_string()))
     }
 
@@ -346,5 +343,35 @@ mod tests {
         let err = WitnessExternalEnv::parse_metadata_entry(&key, &Some(invalid_value)).unwrap_err();
 
         assert!(err.0.contains("bad metadata for bucket 65536"));
+    }
+
+    /// `code_by_hash_ref` serves bytecode from the pre-populated contracts map: the empty-code
+    /// hash short-circuits to empty bytecode, a present hash returns the bytecode (a cheap clone
+    /// sharing the same underlying buffer), and an absent hash errors. revm normally reads code
+    /// inline via `basic_ref`'s `AccountInfo.code`, so this by-hash path is otherwise untested.
+    #[test]
+    fn code_by_hash_ref_serves_contracts_map() {
+        let header = Header::default();
+        let witness = LightWitness { kvs: Default::default(), levels: Default::default() };
+
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x01]));
+        let hash = code.hash_slow();
+        let mut contracts = HashMap::default();
+        contracts.insert(hash, code.clone());
+
+        let db = WitnessDatabase { header: &header, witness: &witness, contracts: &contracts };
+
+        // Empty-code hash short-circuits to empty bytecode without touching the map.
+        assert!(db.code_by_hash_ref(KECCAK_EMPTY).unwrap().is_empty());
+
+        let got = db.code_by_hash_ref(hash).unwrap();
+        // Correctness: the bytecode for the requested hash came back.
+        assert_eq!(got.bytes_slice(), code.bytes_slice());
+        // Cheap-clone property: the returned value shares the same underlying allocation.
+        assert_eq!(got.bytes_slice().as_ptr(), code.bytes_slice().as_ptr());
+
+        // Absent hash errors.
+        let err = db.code_by_hash_ref(B256::from([0xAB; 32])).unwrap_err();
+        assert!(err.0.contains("Code not found"));
     }
 }
