@@ -208,6 +208,15 @@ pub fn iter_code_hashes(
     })
 }
 
+/// [`iter_code_hashes`], deduplicated and sorted for stable ordering — the
+/// form witness fetchers want (e.g. the trace server).
+pub fn collect_code_hashes(kvs: &BTreeMap<SaltKey, Option<SaltValue>>) -> Vec<B256> {
+    let mut hashes: Vec<B256> = iter_code_hashes(kvs).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use std::vec;
@@ -312,5 +321,19 @@ mod tests {
     #[test]
     fn test_iter_code_hashes_empty() {
         assert_eq!(iter_code_hashes(&BTreeMap::new()).count(), 0);
+    }
+
+    #[test]
+    fn test_collect_code_hashes_dedups_and_sorts() {
+        let hi = B256::from([0xEE; 32]);
+        let lo = B256::from([0x11; 32]);
+        // Iteration order yields [hi, lo, hi]: unsorted and with a duplicate.
+        let map = kvs(vec![
+            Some(account_kv(1, Some(hi))),
+            Some(account_kv(2, Some(lo))),
+            Some(account_kv(3, Some(hi))),
+        ]);
+        assert_eq!(iter_code_hashes(&map).collect::<Vec<_>>(), vec![hi, lo, hi]);
+        assert_eq!(collect_code_hashes(&map), vec![lo, hi]);
     }
 }
