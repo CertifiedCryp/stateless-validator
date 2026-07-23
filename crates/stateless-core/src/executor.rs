@@ -8,6 +8,8 @@
 //!
 //! - [`validate_block`]: Main validation entry point that orchestrates witness verification,
 //!   transaction replay, and state root comparison
+//! - [`validate_block_deriving_updates`]: Variant returning the replay-derived SALT state updates
+//!   for embedders that compare against an independently verified per-block changeset
 //! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
@@ -173,8 +175,70 @@ pub struct ValidationStats {
     pub witness_verification_time: f64,
     /// Time spent replaying block transactions (seconds; `0.0` in `no_std` builds)
     pub block_replay_time: f64,
-    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds)
+    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds).
+    ///
+    /// In [`validate_block`] this covers deriving the state updates **and** the SALT trie root
+    /// update; in [`validate_block_deriving_updates`] it covers only the state-update derivation
+    /// (no trie math happens there).
     pub salt_update_time: f64,
+}
+
+/// Caller policy for [`validate_block_deriving_updates`]: how the witnesses are bound to the
+/// canonical chain before the derived updates are handed back.
+///
+/// Both witness proofs are always verified (the SALT witness's IPA proof, the MPT witness's
+/// Merkle proof); the anchor is an *additional* binding. Build with [`Self::anchored`] — the
+/// standard form — or [`Self::unanchored`], an explicit opt-out; there is deliberately no
+/// `Default`, so skipping the parent binding must be spelled out at the call site.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ValidationOptions {
+    /// When set (via [`Self::anchored`]), require each witness's own pre-root to equal the
+    /// parent block's matching post root before any other work: the SALT witness's state root
+    /// against [`ParentAnchor::state_root`] (failing with
+    /// [`ValidationError::PreStateRootMismatch`]), then the MPT witness's storage root against
+    /// [`ParentAnchor::withdrawals_root`] (failing with
+    /// [`ValidationError::PreWithdrawalsRootMismatch`]).
+    ///
+    /// This is the only check that binds the MPT witness's *pre*-state to the chain:
+    /// [`MptWitness::verify`] proves the witness against its own claimed `storage_root` and
+    /// binds the *post* root to the block header, which exposes a fabricated pre-state only
+    /// when the fabrication survives into the post root — a fabrication confined to slots
+    /// this block rewrites converges to the correct post root and passes verify. The anchor
+    /// also fails fast, before any replay work, with the precise pre-root diagnosis rather
+    /// than a post-root error that reads like a replay fault.
+    pub parent_anchor: Option<ParentAnchor>,
+}
+
+/// The parent block's post-root pair that [`validate_block_deriving_updates`] anchors the witnesses
+/// to — the same `(state root, withdrawals root)` pair the standalone pipeline's continuity
+/// check enforces between consecutive blocks.
+///
+/// The pair is anchored atomically: real callers take both roots from the same parent header
+/// (or stored block meta) and never hold one without the other, so there is deliberately no
+/// way to anchor half of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentAnchor {
+    /// The parent block's post state root, matched against the SALT witness's own root.
+    pub state_root: B256,
+    /// The parent block's post withdrawals root, matched against the MPT witness's storage
+    /// root.
+    pub withdrawals_root: B256,
+}
+
+impl ValidationOptions {
+    /// Anchors both witnesses to the parent block's post-root pair — the standard way to
+    /// build the options (see [`Self::parent_anchor`]).
+    pub fn anchored(state_root: B256, withdrawals_root: B256) -> Self {
+        Self { parent_anchor: Some(ParentAnchor { state_root, withdrawals_root }) }
+    }
+
+    /// No parent anchoring: the returned updates are bound to the canonical chain only by
+    /// the caller's own changeset comparison. Reserve this for callers that genuinely lack
+    /// a parent header — skipping the anchor is deliberately spelled out, never a default.
+    pub fn unanchored() -> Self {
+        Self { parent_anchor: None }
+    }
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -440,6 +504,207 @@ where
     Ok((receipts_root, logs_bloom, gas_used))
 }
 
+/// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
+/// accounts, keyed by the hashed slot as [`MptWitness::verify`] expects.
+fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U256> {
+    accounts
+        .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
+        .map(|a| {
+            a.storage
+                .iter()
+                .filter(|(_, v)| v.previous_or_original_value != v.present_value)
+                .map(|(&slot, v)| (keccak256(B256::from(slot)), v.present_value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Derives the canonical SALT [`StateUpdates`] for a block from the replayed account states,
+/// by flattening Revm's `BundleAccount` format into plain key-value pairs and applying them to
+/// an ephemeral SALT state built over the witness.
+///
+/// The result is the net `{key ↦ (old, new)}` map between the block's pre- and post-states —
+/// the same map the SALT trie update consumes and the sequencer's `SaltDeltas` are derived from.
+fn derive_state_updates(
+    witness: &Witness,
+    accounts: HashMap<Address, BundleAccount>,
+) -> Result<StateUpdates, ValidationError> {
+    // Flatten Revm's BundleAccount format into plain key-value pairs
+    let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    for (address, bundle_account) in accounts {
+        if bundle_account.info != bundle_account.original_info {
+            // Process account changes
+            let account = bundle_account.info.map(|info| Account {
+                nonce: info.nonce,
+                balance: info.balance,
+                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
+            });
+
+            let account_key = PlainKey::Account(address).encode();
+            let account_value = account.and_then(|account| {
+                (!account.is_empty()).then(|| PlainValue::Account(account).encode())
+            });
+            kv_updates.insert(account_key, account_value);
+        }
+
+        // Process storage changes
+        for (slot, value) in bundle_account.storage {
+            if value.previous_or_original_value != value.present_value {
+                let storage_key =
+                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
+                let storage_value = (!value.present_value.is_zero())
+                    .then(|| PlainValue::Storage(value.present_value).encode());
+                kv_updates.insert(storage_key, storage_value);
+            }
+        }
+    }
+
+    // Update the SALT state: Apply updates first, then inserts/deletes in deterministic key
+    // order (same as Witness::create). This ordering is critical: inserts/deletes may trigger
+    // key displacement or bucket expansion, invalidating the witness's direct lookup table.
+    let mut witness_state = EphemeralSaltState::new(witness);
+    let mut state_updates = StateUpdates::default();
+    let mut inserts_or_deletes = BTreeMap::new();
+
+    for (plain_key, opt_plain_value) in kv_updates {
+        if let (Ok(Some((salt_key, old_value))), Some(new_value)) =
+            (witness_state.find(&plain_key), &opt_plain_value)
+        {
+            // Update operation: key exists and new value is not None
+            witness_state.update_value(
+                &mut state_updates,
+                salt_key,
+                Some(old_value),
+                Some(SaltValue::new(&plain_key, new_value)),
+            );
+        } else {
+            inserts_or_deletes.insert(plain_key, opt_plain_value);
+        }
+    }
+    state_updates.merge(
+        witness_state
+            .update_fin(&inserts_or_deletes)
+            .map_err(ValidationError::StateUpdateFailed)?,
+    );
+
+    Ok(state_updates)
+}
+
+/// Verifies the replayed block's outputs against the header's claims: the withdrawals root
+/// (via the MPT witness over the changed withdrawal-contract slots), the receipts root, the
+/// logs bloom, and the total gas used.
+fn verify_replay_outputs(
+    header: &alloy_consensus::Header,
+    output: &BlockExecutionOutput,
+    withdrawal_storage: B256Map<U256>,
+    mpt_witness: &MptWitness,
+) -> Result<(), ValidationError> {
+    // Check if computed withdrawals root matches the claimed one
+    mpt_witness
+        .verify(header, withdrawal_storage)
+        .map_err(ValidationError::WithdrawalValidationFailed)?;
+
+    // Verify receipts root matches the block header
+    if output.receipts_root != header.receipts_root {
+        return Err(ValidationError::ReceiptsRootMismatch {
+            actual: output.receipts_root,
+            claimed: header.receipts_root,
+        });
+    }
+
+    // Verify logs bloom matches the block header
+    if output.logs_bloom != header.logs_bloom {
+        return Err(ValidationError::LogsBloomMismatch {
+            actual: Box::new(output.logs_bloom),
+            claimed: Box::new(header.logs_bloom),
+        });
+    }
+
+    // Verify gas used matches the block header
+    if output.gas_used != header.gas_used {
+        return Err(ValidationError::GasUsedMismatch {
+            actual: output.gas_used,
+            claimed: header.gas_used,
+        });
+    }
+
+    Ok(())
+}
+
+/// Runs the fallible `f` and returns its success value together with the elapsed wall-clock
+/// seconds — `0.0` in `no_std` builds, where no monotonic clock is available ("not
+/// measured"). On error the elapsed time is discarded with the stage's result.
+fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let result = f()?;
+    #[cfg(feature = "std")]
+    let elapsed = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let elapsed = 0.0_f64;
+    Ok((result, elapsed))
+}
+
+/// Output of [`verify_and_replay`], the stages shared by [`validate_block`] and
+/// [`validate_block_deriving_updates`].
+struct VerifiedReplay {
+    /// The proof-verified witness the block was replayed over.
+    witness: Witness,
+    /// Net per-account state changes from the replay.
+    accounts: HashMap<Address, BundleAccount>,
+    /// Execution outputs claimed by the header, plus state access counts.
+    output: BlockExecutionOutput,
+    /// Stats for the completed stages; [`ValidationStats::salt_update_time`] is left `0.0`
+    /// for the caller's own final stage.
+    stats: ValidationStats,
+}
+
+/// Verifies the witness IPA proof and replays the block's transactions over it — the front
+/// half shared by [`validate_block`] and [`validate_block_deriving_updates`]. Callers gate on
+/// [`BlockInput::is_complete`] first.
+fn verify_and_replay<B: BlockInput>(
+    chain_spec: &ChainSpec,
+    block: &B,
+    salt_witness: SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
+) -> Result<VerifiedReplay, ValidationError> {
+    let header = block.consensus_header();
+
+    // Create external environment oracle from salt witness
+    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Verify witness proof against its internal state root
+    let (witness, witness_verification_time) = timed(|| {
+        let witness = Witness::from(salt_witness);
+        witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
+        Ok::<_, ValidationError>(witness)
+    })?;
+
+    // Replay block transactions
+    let ((accounts, output), block_replay_time) = timed(|| {
+        let witness_db = WitnessDatabase { header, witness: &witness, contracts };
+        replay_block(
+            chain_spec,
+            block,
+            &witness_db,
+            ext_env,
+            #[cfg(feature = "std")]
+            writer,
+        )
+    })?;
+
+    let stats = ValidationStats {
+        state_reads: output.state_reads,
+        state_writes: output.state_writes,
+        witness_verification_time,
+        block_replay_time,
+        salt_update_time: 0.0,
+    };
+    Ok(VerifiedReplay { witness, accounts, output, stats })
+}
+
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
 ///
 /// This function performs the core validation logic:
@@ -479,143 +744,32 @@ pub fn validate_block<B: BlockInput>(
     }
     let header = block.consensus_header();
 
-    // Create external environment oracle from salt witness
-    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
-        .map_err(ValidationError::EnvOracleConstructionFailed)?;
-
-    // Verify witness proof against the current state root
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let witness = Witness::from(salt_witness);
-    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
-    #[cfg(feature = "std")]
-    let witness_verification_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
-
-    // Replay block transactions
-    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-    let (accounts, output) = replay_block(
+    // Verify the witness proof and replay the block's transactions over it
+    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
         chain_spec,
         block,
-        &witness_db,
-        ext_env,
+        salt_witness,
+        contracts,
         #[cfg(feature = "std")]
         writer,
     )?;
-    #[cfg(feature = "std")]
-    let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
-    #[cfg(not(feature = "std"))]
-    let block_replay_time = 0.0_f64; // no_std: timing unavailable
 
     // Extract and hash storage updates (only changed values)
-    let withdrawal_storage: B256Map<U256> = accounts
-        .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
-        .map(|a| {
-            a.storage
-                .iter()
-                .filter(|(_, v)| v.previous_or_original_value != v.present_value)
-                .map(|(&slot, v)| (keccak256(B256::from(slot)), v.present_value))
-                .collect()
-        })
-        .unwrap_or_default();
+    let withdrawal_storage = withdrawal_storage(&accounts);
 
-    // Flatten Revm's BundleAccount format into plain key-value pairs
-    let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-    for (address, bundle_account) in accounts {
-        if bundle_account.info != bundle_account.original_info {
-            // Process account changes
-            let account = bundle_account.info.map(|info| Account {
-                nonce: info.nonce,
-                balance: info.balance,
-                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
-            });
+    // Derive the net SALT state updates from the replayed accounts and roll them into the
+    // trie to compute the post state root
+    let (state_root, salt_update_time) = timed(|| {
+        let state_updates = derive_state_updates(&witness, accounts)?;
+        let (state_root, _) = StateRoot::new(&witness)
+            .update_fin(&state_updates)
+            .map_err(ValidationError::TrieUpdateFailed)?;
+        Ok::<_, ValidationError>(state_root)
+    })?;
+    stats.salt_update_time = salt_update_time;
 
-            let account_key = PlainKey::Account(address).encode();
-            let account_value = account.and_then(|account| {
-                (!account.is_empty()).then(|| PlainValue::Account(account).encode())
-            });
-            kv_updates.insert(account_key, account_value);
-        }
-
-        // Process storage changes
-        for (slot, value) in bundle_account.storage {
-            if value.previous_or_original_value != value.present_value {
-                let storage_key =
-                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
-                let storage_value = (!value.present_value.is_zero())
-                    .then(|| PlainValue::Storage(value.present_value).encode());
-                kv_updates.insert(storage_key, storage_value);
-            }
-        }
-    }
-
-    // Update the SALT state: Apply updates first, then inserts/deletes in deterministic key
-    // order (same as Witness::create). This ordering is critical: inserts/deletes may trigger
-    // key displacement or bucket expansion, invalidating the witness's direct lookup table.
-    let mut witness_state = EphemeralSaltState::new(&witness);
-    let mut state_updates = StateUpdates::default();
-    let mut inserts_or_deletes = BTreeMap::new();
-
-    for (plain_key, opt_plain_value) in kv_updates {
-        if let (Ok(Some((salt_key, old_value))), Some(new_value)) =
-            (witness_state.find(&plain_key), &opt_plain_value)
-        {
-            // Update operation: key exists and new value is not None
-            witness_state.update_value(
-                &mut state_updates,
-                salt_key,
-                Some(old_value),
-                Some(SaltValue::new(&plain_key, new_value)),
-            );
-        } else {
-            inserts_or_deletes.insert(plain_key, opt_plain_value);
-        }
-    }
-    state_updates.merge(
-        witness_state
-            .update_fin(&inserts_or_deletes)
-            .map_err(ValidationError::StateUpdateFailed)?,
-    );
-
-    // Update the state root
-    let (state_root, _) = StateRoot::new(&witness)
-        .update_fin(&state_updates)
-        .map_err(ValidationError::TrieUpdateFailed)?;
-    #[cfg(feature = "std")]
-    let salt_update_time =
-        start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
-    #[cfg(not(feature = "std"))]
-    let salt_update_time = 0.0_f64; // no_std: timing unavailable
-
-    // Check if computed withdrawals root matches the claimed one
-    mpt_witness
-        .verify(header, withdrawal_storage)
-        .map_err(ValidationError::WithdrawalValidationFailed)?;
-
-    // Verify receipts root matches the block header
-    if output.receipts_root != header.receipts_root {
-        return Err(ValidationError::ReceiptsRootMismatch {
-            actual: output.receipts_root,
-            claimed: header.receipts_root,
-        });
-    }
-
-    // Verify logs bloom matches the block header
-    if output.logs_bloom != header.logs_bloom {
-        return Err(ValidationError::LogsBloomMismatch {
-            actual: Box::new(output.logs_bloom),
-            claimed: Box::new(header.logs_bloom),
-        });
-    }
-
-    // Verify gas used matches the block header
-    if output.gas_used != header.gas_used {
-        return Err(ValidationError::GasUsedMismatch {
-            actual: output.gas_used,
-            claimed: header.gas_used,
-        });
-    }
+    // Verify the replayed outputs against the header's claims
+    verify_replay_outputs(header, &output, withdrawal_storage, &mpt_witness)?;
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);
@@ -626,20 +780,183 @@ pub fn validate_block<B: BlockInput>(
         });
     }
 
-    Ok(ValidationStats {
-        state_reads: output.state_reads,
-        state_writes: output.state_writes,
-        witness_verification_time,
-        block_replay_time,
-        salt_update_time,
-    })
+    Ok(stats)
+}
+
+/// Validates a block by replaying its transactions over the witness and returning the derived
+/// SALT [`StateUpdates`] instead of computing the post state root.
+///
+/// This is the entry point for embedders that already hold an independently verified per-block
+/// changeset for the same block (e.g. a MegaETH full node, whose state sync persists the
+/// sequencer's hash-verified `SaltDeltas`): comparing the returned net update map against that
+/// changeset replaces the SALT trie/commitment recompute that [`validate_block`] performs.
+///
+/// Differences from [`validate_block`]:
+/// - Returns the replay-derived [`StateUpdates`] (the net `{key ↦ (old, new)}` map between the
+///   block's pre- and post-states); **no post state root is computed or checked** — the caller owns
+///   that comparison. The map carries account and storage records only: newly deployed bytecode is
+///   not derivable from it, so a changeset comparison does not cover the embedder's `codes` and
+///   bytecode integrity must be enforced at ingest.
+/// - [`ValidationOptions::parent_anchor`], when provided, is checked against both witnesses' own
+///   pre-roots before any other work, anchoring them to the canonical parent block — see its field
+///   docs for what each half binds and which error it raises.
+///
+/// Both witness proofs (the SALT witness's IPA proof before replay, the MPT witness's Merkle
+/// proof on the replay outputs) are always verified, exactly as in [`validate_block`].
+/// On success, [`ValidationStats::salt_update_time`] holds the state-update derivation time
+/// (there is no trie update here).
+pub fn validate_block_deriving_updates<B: BlockInput>(
+    chain_spec: &ChainSpec,
+    block: &B,
+    salt_witness: SaltWitness,
+    mpt_witness: MptWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    options: ValidationOptions,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
+) -> Result<(StateUpdates, ValidationStats), ValidationError> {
+    // A block carrying only transaction hashes can't be replayed — fail fast before paying
+    // the witness proof verification. `replay_block` re-checks for direct callers.
+    if !block.is_complete() {
+        return Err(ValidationError::BlockIncomplete);
+    }
+    let header = block.consensus_header();
+
+    // Anchor both witnesses to the canonical parent block before any other work.
+    if let Some(anchor) = options.parent_anchor {
+        let actual = B256::from(
+            salt_witness.state_root().map_err(ValidationError::WitnessVerificationFailed)?,
+        );
+        if actual != anchor.state_root {
+            return Err(ValidationError::PreStateRootMismatch {
+                expected: anchor.state_root,
+                actual,
+            });
+        }
+        if mpt_witness.storage_root != anchor.withdrawals_root {
+            return Err(ValidationError::PreWithdrawalsRootMismatch {
+                expected: anchor.withdrawals_root,
+                actual: mpt_witness.storage_root,
+            });
+        }
+    }
+
+    // Verify the witness proof and replay the block's transactions over it
+    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
+        chain_spec,
+        block,
+        salt_witness,
+        contracts,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+
+    // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
+    // before the more expensive state-update derivation.
+    verify_replay_outputs(header, &output, withdrawal_storage(&accounts), &mpt_witness)?;
+
+    // Derive the net SALT state updates from the replayed accounts
+    let (state_updates, salt_update_time) = timed(|| derive_state_updates(&witness, accounts))?;
+    stats.salt_update_time = salt_update_time;
+
+    Ok((state_updates, stats))
 }
 
 #[cfg(test)]
 mod tests {
+    use salt::METADATA_KEYS_RANGE;
     use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 
     use super::*;
+
+    /// Chain spec for the mainnet fixtures. Parsed per call: the 1.8 KB genesis is noise
+    /// next to the witness work every caller performs, and a memoizing `static` would need
+    /// real-std machinery (`LazyLock`) that `no_std` test builds cannot name (see lib.rs).
+    fn chain_spec() -> ChainSpec {
+        ChainSpec::from_genesis(TestFixtures::mainnet_shared().load_genesis().unwrap())
+    }
+
+    /// Runs [`validate_block_deriving_updates`] for one fixture block over the given witness.
+    fn run_updates(
+        fx: &TestFixtures,
+        block: &Block<OpTransaction>,
+        salt_witness: SaltWitness,
+        hash: B256,
+        options: ValidationOptions,
+    ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
+        validate_block_deriving_updates(
+            &chain_spec(),
+            block,
+            salt_witness,
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            options,
+            #[cfg(feature = "std")]
+            None,
+        )
+    }
+
+    /// Runs [`validate_block`] for one fixture block over the given witness.
+    fn run_block(
+        fx: &TestFixtures,
+        block: &Block<OpTransaction>,
+        salt_witness: SaltWitness,
+        hash: B256,
+    ) -> Result<ValidationStats, ValidationError> {
+        validate_block(
+            &chain_spec(),
+            block,
+            salt_witness,
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            #[cfg(feature = "std")]
+            None,
+        )
+    }
+
+    /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)
+    /// value flipped, re-encoded through [`SaltValue::new`] so the entry stays structurally
+    /// valid and nothing short of the proof check can notice.
+    fn tampered_witness(fx: &TestFixtures, hash: B256) -> SaltWitness {
+        let mut salt_witness = fx.salt_witnesses[&hash].clone();
+        let value = salt_witness
+            .kvs
+            .iter_mut()
+            .filter(|(key, _)| !METADATA_KEYS_RANGE.contains(key))
+            .find_map(|(_, value)| value.as_mut().filter(|v| !v.value().is_empty()))
+            .expect("fixture witness must hold a non-metadata value");
+        let key = value.key().to_vec();
+        let mut tampered = value.value().to_vec();
+        tampered[0] ^= 0x01;
+        *value = SaltValue::new(&key, &tampered);
+        salt_witness
+    }
+
+    /// The first paired fixture block with its transactions stripped down to hashes only.
+    fn hashes_only_block(fx: &TestFixtures) -> (B256, Block<OpTransaction>) {
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let mut block = fx.blocks[&hash].clone();
+        block.transactions = BlockTransactions::Hashes(Default::default());
+        (hash, block)
+    }
+
+    /// Asserts that replay-derived `updates` reproduce the block header's state root when fed
+    /// through the SALT trie update (read directly off the borrowed witness).
+    fn assert_updates_reproduce_state_root(
+        salt_witness: &SaltWitness,
+        updates: &StateUpdates,
+        block: &Block<OpTransaction>,
+        number: u64,
+        hash: B256,
+    ) {
+        let (state_root, _) = StateRoot::new(salt_witness)
+            .update_fin(updates)
+            .unwrap_or_else(|e| panic!("trie update failed for {number} ({hash}): {e:?}"));
+        assert_eq!(
+            B256::from(state_root),
+            block.consensus_header().state_root,
+            "updates from {number} ({hash}) must reproduce the header state root"
+        );
+    }
 
     /// Locks the `BlockInput` projection for RPC blocks: completeness, hash/header passthrough,
     /// and clone-free recovered senders (including the empty projection of a hashes-only block).
@@ -676,21 +993,9 @@ mod tests {
     #[test]
     fn validate_block_rejects_hashes_only_block() {
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
-        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
-        let mut block = fx.blocks[&hash].clone();
-        block.transactions = BlockTransactions::Hashes(Default::default());
+        let (hash, block) = hashes_only_block(fx);
 
-        let err = validate_block(
-            &chain_spec,
-            &block,
-            fx.salt_witnesses[&hash].clone(),
-            fx.mpt_witness(&hash),
-            &fx.contracts,
-            #[cfg(feature = "std")]
-            None,
-        )
-        .unwrap_err();
+        let err = run_block(fx, &block, fx.salt_witnesses[&hash].clone(), hash).unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
@@ -698,20 +1003,156 @@ mod tests {
     fn validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
-            validate_block(
-                &chain_spec,
-                &fx.blocks[&hash],
-                fx.salt_witnesses[&hash].clone(),
-                fx.mpt_witness(&hash),
-                &fx.contracts,
-                #[cfg(feature = "std")]
-                None,
-            )
-            .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
+            let block = &fx.blocks[&hash];
+            run_block(fx, block, fx.salt_witnesses[&hash].clone(), hash)
+                .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
         }
+    }
+
+    /// `validate_block_deriving_updates` must succeed on every paired mainnet fixture — anchored to
+    /// the parent whenever it is in the fixture set, the embedder's real call shape — and the
+    /// returned updates must reproduce the header's state root when fed through the SALT trie
+    /// update, locking its equivalence with the `validate_block` path the helpers were
+    /// extracted from.
+    #[test]
+    fn validate_block_deriving_updates_mainnet_fixtures() {
+        let _logging = init_test_logging("stateless_core");
+        let fx = TestFixtures::mainnet_shared();
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let options = match fx.blocks.get(&block.consensus_header().parent_hash) {
+                Some(parent) => ValidationOptions::anchored(
+                    parent.header.inner.state_root,
+                    parent.header.inner.withdrawals_root.unwrap_or_else(|| {
+                        panic!("parent of {number} ({hash}) lacks a withdrawals root")
+                    }),
+                ),
+                None => ValidationOptions::unanchored(),
+            };
+            let (updates, stats) =
+                run_updates(fx, block, fx.salt_witnesses[&hash].clone(), hash, options)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "validate_block_deriving_updates failed for {number} ({hash}): {e:?}"
+                        )
+                    });
+            // `no_std` builds have no monotonic clock — every timing reads 0.0 ("not measured"),
+            // so the timed-verification expectation only holds with `std` enabled.
+            assert!(
+                stats.witness_verification_time > 0.0 || cfg!(not(feature = "std")),
+                "witness verification must be timed in std builds"
+            );
+
+            // Cross-check: the returned updates must yield the header's state root.
+            assert_updates_reproduce_state_root(
+                &fx.salt_witnesses[&hash],
+                &updates,
+                block,
+                number,
+                hash,
+            );
+        }
+    }
+
+    /// The parent anchor must match the parent header's post-root pair on every paired
+    /// fixture, and reject a mismatch on either half with that half's error — before any
+    /// witness verification or replay work.
+    #[test]
+    fn validate_block_deriving_updates_anchors_to_parent() {
+        let fx = TestFixtures::mainnet_shared();
+
+        // Every paired fixture witness must carry the parent header's post-root pair — the
+        // exact values the anchor compares. Near-free: no validation runs; the anchored
+        // accept path is exercised by `validate_block_deriving_updates_mainnet_fixtures`.
+        let mut anchored = None;
+        for (number, hash) in fx.paired_blocks() {
+            let block = &fx.blocks[&hash];
+            let Some(parent) = fx.blocks.get(&block.consensus_header().parent_hash) else {
+                continue;
+            };
+
+            let state_root = parent.header.inner.state_root;
+            let withdrawals_root =
+                parent.header.inner.withdrawals_root.unwrap_or_else(|| {
+                    panic!("parent of {number} ({hash}) lacks a withdrawals root")
+                });
+            assert_eq!(
+                B256::from(fx.salt_witnesses[&hash].state_root().unwrap()),
+                state_root,
+                "witness root for {number} ({hash}) must be the parent's post state root"
+            );
+            assert_eq!(
+                fx.mpt_witness::<MptWitness>(&hash).storage_root,
+                withdrawals_root,
+                "MPT witness root for {number} ({hash}) must be the parent's post withdrawals root"
+            );
+            anchored.get_or_insert((hash, state_root, withdrawals_root));
+        }
+        let Some((hash, state_root, withdrawals_root)) = anchored else {
+            panic!("no fixture block has its parent in the set — anchor untested");
+        };
+        let block = &fx.blocks[&hash];
+
+        // Reject each mismatched half with its own exactly-field-checked error. The witness
+        // is tampered (it would fail proof verification), so the anchor error surfacing at
+        // all also proves the anchor runs before any proof or replay work — its fail-fast
+        // contract.
+        let bogus = B256::repeat_byte(0xAB);
+        let options = ValidationOptions::anchored(bogus, withdrawals_root);
+        let err = run_updates(fx, block, tampered_witness(fx, hash), hash, options).unwrap_err();
+        match err {
+            ValidationError::PreStateRootMismatch { expected, actual } => {
+                assert_eq!(expected, bogus);
+                assert_eq!(actual, state_root);
+            }
+            other => panic!("expected PreStateRootMismatch, got {other:?}"),
+        }
+
+        // The matching state half must pass through to the withdrawals check.
+        let options = ValidationOptions::anchored(state_root, bogus);
+        let err = run_updates(fx, block, tampered_witness(fx, hash), hash, options).unwrap_err();
+        match err {
+            ValidationError::PreWithdrawalsRootMismatch { expected, actual } => {
+                assert_eq!(expected, bogus);
+                assert_eq!(actual, withdrawals_root);
+            }
+            other => panic!("expected PreWithdrawalsRootMismatch, got {other:?}"),
+        }
+    }
+
+    /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` before
+    /// the parent anchor or any witness work.
+    #[test]
+    fn validate_block_deriving_updates_rejects_hashes_only_block() {
+        let fx = TestFixtures::mainnet_shared();
+        let (hash, block) = hashes_only_block(fx);
+
+        let witness = fx.salt_witnesses[&hash].clone();
+        let err =
+            run_updates(fx, &block, witness, hash, ValidationOptions::unanchored()).unwrap_err();
+        assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
+    }
+
+    /// Corrupting a single witnessed value must fail both entry points with
+    /// `WitnessVerificationFailed` — the IPA proof check is unconditional, with no knob to
+    /// skip it.
+    #[test]
+    fn tampered_witness_fails_proof_verification() {
+        let fx = TestFixtures::mainnet_shared();
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let block = &fx.blocks[&hash];
+
+        let tampered = tampered_witness(fx, hash);
+        let err =
+            run_updates(fx, block, tampered, hash, ValidationOptions::unanchored()).unwrap_err();
+        assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
+
+        let err = run_block(fx, block, tampered_witness(fx, hash), hash).unwrap_err();
+        assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
     }
 }
