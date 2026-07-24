@@ -206,7 +206,10 @@ impl CacheMetrics {
     }
 }
 
-/// Tracks which source provided block data (cache/db/witness_generator).
+/// Tracks which source provided block data. Sources: `cache`, `db`, and the two RPC witness
+/// routes — `witness_generator` (full endpoint chain, generator first) and
+/// `witness_historical` (skip-generator chain for blocks at least the local window below the
+/// tip). The RPC path as a whole is the sum of the two witness labels.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct DataSourceMetrics {
@@ -421,6 +424,7 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("cache");
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
+    let _ = DataSourceMetrics::new_for_source("witness_historical");
 
     // Data Fetch Layer: single-flight
     let _ = SingleFlightMetrics::new_for_type("new");
@@ -439,6 +443,7 @@ fn pre_register_all_metrics() {
 
     // Witness Layer
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
+    let _ = WitnessSourceMetrics::new_for_source("witness_historical");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);

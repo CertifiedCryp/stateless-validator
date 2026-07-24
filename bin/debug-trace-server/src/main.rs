@@ -3,6 +3,9 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
+//! Request-serving witness fetches route by block age: historical blocks skip the internal
+//! generator endpoint (which only retains a small recent window) and go straight to the
+//! fallback endpoints. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -37,7 +40,7 @@
 //! - `debug_getCacheStatus` - Query current response cache status
 //!
 //! # Operating Modes
-//! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC
+//! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC endpoints
 //! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
 use std::{path::PathBuf, sync::Arc};
@@ -68,7 +71,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
-use data_provider::{DataProvider, NoopContractStore};
+use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::{BlockStore, ServerDB};
@@ -95,17 +98,26 @@ struct Args {
     )]
     rpc_endpoint: Vec<String>,
 
-    /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
+    /// One or more durable witness endpoint URLs for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
-    /// list (`--witness-endpoint a,b`, also via the env var).
+    /// list (`--witness-endpoint a,b`, also via the env var). No endpoint here is ever special
+    /// by position; declare the internal generator via `--witness-generator-endpoint`.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
-        required = true,
+        required_unless_present = "witness_generator_endpoint",
         value_delimiter = ',',
         action = clap::ArgAction::Append,
     )]
     witness_endpoint: Vec<String>,
+
+    /// The internal witness generator endpoint. It is probed first for recent blocks and
+    /// skipped for historical ones (it only retains about `--witness-local-window` blocks),
+    /// while `--witness-endpoint` lists the durable fallbacks (optional when this flag is
+    /// set — generator-only works like any single-endpoint config, without routing). When
+    /// absent, historical routing is disabled and every witness endpoint is plain failover.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_GENERATOR_ENDPOINT")]
+    witness_generator_endpoint: Option<String>,
 
     /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
@@ -198,9 +210,38 @@ struct Args {
     data_max_concurrent_requests: Option<usize>,
 
     /// Maximum concurrent in-flight witness fetches, independent of the data cap.
-    /// Omit for unlimited.
+    /// Omit for unlimited. One global cap: recent and historical witness routes share it.
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
     witness_max_concurrent_requests: Option<usize>,
+
+    /// Blocks fewer than this many blocks below the local tip fetch witnesses through the
+    /// full witness endpoint chain (internal generator first); blocks at least this far below
+    /// skip the first witness endpoint — the generator only retains about this window (its
+    /// `BACKUP` env, deployed at 4096), so probing it for historical blocks is a guaranteed
+    /// miss. Requires a generator plus at least one fallback witness endpoint (see
+    /// `--witness-generator-endpoint`) and a local DB (`--data-dir`), whose tip
+    /// anchors block age; otherwise all blocks use the full chain. Applies to request
+    /// serving; chain-sync prefetch always uses the full chain. Should match the generator's
+    /// `BACKUP`.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW",
+        default_value_t = data_provider::DEFAULT_WITNESS_LOCAL_WINDOW
+    )]
+    witness_local_window: u64,
+
+    /// Witness-stage budget in seconds for blocks at or below the local tip. Defaults to the
+    /// full `--witness-timeout` budget (tracking it when raised); lower it to fail fast on
+    /// blocks whose witness is likely pruned everywhere. Clamped to `--witness-timeout`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT")]
+    witness_old_block_timeout: Option<u64>,
+
+    /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
+    /// fetcher does not race the witness generator — a fetch issued the moment a block appears
+    /// typically arrives before its witness is written and burns a failed round plus a backoff
+    /// sleep. 0 = fetch right at the head.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_TIP_BUFFER", default_value_t = 2)]
+    tip_buffer: u64,
 
     /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
     #[clap(
@@ -255,9 +296,56 @@ fn parse_size(s: &str) -> Result<u64, String> {
     value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
 }
 
+/// Effective old-block witness budget in seconds: the flag when set (clamped to
+/// `--witness-timeout`), otherwise the full `--witness-timeout` budget — raising the witness
+/// budget also raises the old-block cap.
+fn old_block_witness_timeout_secs(args: &Args) -> u64 {
+    args.witness_old_block_timeout.unwrap_or(args.witness_timeout).min(args.witness_timeout)
+}
+
+/// The combined witness endpoint chain: the declared internal generator
+/// (`--witness-generator-endpoint`) first when configured, then the durable fallbacks in
+/// their configured order. Without the flag no endpoint is special — the chain is plain
+/// failover.
+fn witness_endpoint_chain(args: &Args) -> Vec<&str> {
+    args.witness_generator_endpoint
+        .as_deref()
+        .into_iter()
+        .chain(args.witness_endpoint.iter().map(String::as_str))
+        .collect()
+}
+
+/// Validates cross-flag invariants that clap cannot express per-field.
+fn validate_args(args: &Args) -> Result<()> {
+    // Early, flag-named mirror of `PipelineConfig::validate` (see its doc for the rationale);
+    // only meaningful with chain sync, where `blocks_to_keep` becomes the stale-reset
+    // threshold.
+    if args.data_dir.is_some() && args.tip_buffer >= args.blocks_to_keep {
+        eyre::bail!(
+            "--tip-buffer ({}) must be smaller than --blocks-to-keep ({})",
+            args.tip_buffer,
+            args.blocks_to_keep
+        );
+    }
+    // A generator listed again under --witness-endpoint would put the generator back into the
+    // historical route's fallback rotation — every historical fetch would probe the pruned
+    // endpoint the routing exists to skip, silently. The likely cause is migrating to
+    // --witness-generator-endpoint without removing the generator from the fallback list.
+    if let Some(generator) = &args.witness_generator_endpoint &&
+        args.witness_endpoint.contains(generator)
+    {
+        eyre::bail!(
+            "--witness-generator-endpoint ({generator}) must not also appear in \
+             --witness-endpoint: list the generator once, via the dedicated flag"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    validate_args(&args)?;
     let _log_guard = args.log.init_tracing()?;
 
     info!(
@@ -265,10 +353,25 @@ async fn main() -> Result<()> {
         "Debug-trace-server starting"
     );
     let response_cache_disabled = args.response_cache_estimated_items == 0;
+    // The combined witness chain (generator first when configured) — the list actually fed to
+    // the RPC client, not just the fallback flag values.
+    let witness_apis = witness_endpoint_chain(&args);
+    let witness_cfg = WitnessFetchConfig {
+        witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
+        old_block_witness_timeout: std::time::Duration::from_secs(old_block_witness_timeout_secs(
+            &args,
+        )),
+        local_window: args.witness_local_window,
+        generator_first: args.witness_generator_endpoint.is_some(),
+    };
     debug!(
         rpc_endpoints = ?args.rpc_endpoint,
-        witness_endpoints = ?args.witness_endpoint,
+        witness_endpoints = ?witness_apis,
+        witness_generator_configured = witness_cfg.generator_first,
         witness_timeout_secs = args.witness_timeout,
+        witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
+        witness_local_window = args.witness_local_window,
+        tip_buffer = args.tip_buffer,
         response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
@@ -291,7 +394,6 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let rpc_defaults = RpcClientConfig::trace_server();
     let per_attempt_timeout = args
         .rpc_per_attempt_timeout_ms
@@ -306,6 +408,30 @@ async fn main() -> Result<()> {
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
+
+    // The same predicate `fetch_witness` evaluates per request: a declared generator plus at
+    // least one fallback in the combined chain.
+    let routing_configured = witness_cfg.generator_first && witness_apis.len() >= 2;
+    match (routing_configured, args.data_dir.is_some()) {
+        (true, true) => info!(
+            witness_local_window = args.witness_local_window,
+            // The credential-stripped label, not the raw URL — configured endpoint URLs
+            // may carry userinfo or token queries and this log line is info-level.
+            skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
+            "Historical witnesses (at least the local window below the tip) skip the \
+             internal generator endpoint"
+        ),
+        (true, false) => warn!(
+            "Witness generator plus fallback endpoints but no --data-dir: historical witness \
+             routing is inactive (block age is anchored to the local DB tip); all witness \
+             fetches use the full endpoint chain"
+        ),
+        (false, _) => debug!(
+            "No --witness-generator-endpoint (or no fallback endpoints); historical witness \
+             routing disabled — witness endpoints are plain failover"
+        ),
+    }
+
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
@@ -326,8 +452,8 @@ async fn main() -> Result<()> {
         rpc_client.clone(),
         block_store.clone(),
         contract_cache,
-        args.witness_timeout,
-        args.block_fetch_timeout,
+        witness_cfg,
+        std::time::Duration::from_secs(args.block_fetch_timeout),
     ));
 
     let chain_spec = load_chain_spec(&args)?;
@@ -358,6 +484,7 @@ async fn main() -> Result<()> {
         // the crate boundary; mutate a default instance instead.
         let mut pipeline_cfg = PipelineConfig::default();
         pipeline_cfg.concurrent_workers = 1;
+        pipeline_cfg.tip_buffer = args.tip_buffer;
         pipeline_cfg.stale_reset_threshold = Some(args.blocks_to_keep);
         let config = Arc::new(pipeline_cfg);
         let processor = Arc::new(TraceProcessor);
@@ -669,6 +796,140 @@ mod tests {
             &["debug-trace-server", "--witness-endpoint", "http://w"],
             |a| a.rpc_endpoint,
         );
+    }
+
+    /// Parses `Args` from the minimal required flags plus `extra`. Callers must hold
+    /// `stateless_test_utils::env::env_lock()` — parsing reads `DEBUG_TRACE_SERVER_*` env
+    /// vars, so it must be serialized with the tests that mutate them.
+    fn parse_args(extra: &[&str]) -> Args {
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        Args::try_parse_from(base.iter().chain(extra)).unwrap()
+    }
+
+    /// Pins the tiered-witness-routing knob defaults (`--witness-local-window` must track the
+    /// generator's `BACKUP`, the old-block budget defaults to the full witness budget) and the
+    /// CLI + env parsing of all three knobs — a typo in an env attribute string would
+    /// otherwise ship silently to env-only container deployments.
+    #[test]
+    fn tiered_routing_flag_defaults() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        let defaults = parse_args(&[]);
+        assert_eq!(defaults.witness_local_window, data_provider::DEFAULT_WITNESS_LOCAL_WINDOW);
+        assert_eq!(defaults.witness_old_block_timeout, None);
+        assert_eq!(
+            old_block_witness_timeout_secs(&defaults),
+            data_provider::DEFAULT_WITNESS_TIMEOUT_SECS,
+            "old blocks default to the full witness budget",
+        );
+        assert_eq!(defaults.tip_buffer, 2);
+
+        // The unset default tracks a raised --witness-timeout; an explicit flag wins.
+        assert_eq!(old_block_witness_timeout_secs(&parse_args(&["--witness-timeout", "20"])), 20);
+        assert_eq!(
+            old_block_witness_timeout_secs(&parse_args(&[
+                "--witness-timeout",
+                "20",
+                "--witness-old-block-timeout",
+                "3"
+            ])),
+            3
+        );
+
+        assert_eq!(parse_args(&["--tip-buffer", "0"]).tip_buffer, 0);
+        assert_eq!(parse_args(&["--witness-local-window", "128"]).witness_local_window, 128);
+        assert_eq!(
+            parse_args(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout,
+            Some(3)
+        );
+
+        let env = |name, value: &str| {
+            stateless_test_utils::env::with_env_var(&guard, name, value, || parse_args(&[]))
+        };
+        assert_eq!(env("DEBUG_TRACE_SERVER_TIP_BUFFER", "5").tip_buffer, 5);
+        assert_eq!(env("DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW", "256").witness_local_window, 256);
+        assert_eq!(
+            env("DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT", "4").witness_old_block_timeout,
+            Some(4)
+        );
+    }
+
+    /// The witness chain puts the declared generator at index 0; without the flag no endpoint
+    /// is special — even a multi-endpoint list is plain failover, keeping its pre-routing
+    /// behavior.
+    #[test]
+    fn witness_generator_endpoint_chain() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        // Typed flag: generator prepended ahead of the fallbacks.
+        let typed = parse_args(&["--witness-generator-endpoint", "http://gen"]);
+        assert_eq!(witness_endpoint_chain(&typed), vec!["http://gen", "http://w"]);
+
+        // Multiple fallbacks keep their order after the generator.
+        let multi = parse_args(&[
+            "--witness-generator-endpoint",
+            "http://gen",
+            "--witness-endpoint",
+            "http://w2",
+        ]);
+        assert_eq!(witness_endpoint_chain(&multi), vec!["http://gen", "http://w", "http://w2"]);
+
+        // No flag: plain failover chains, regardless of endpoint count.
+        assert_eq!(witness_endpoint_chain(&parse_args(&[])), vec!["http://w"]);
+        let failover_pair = parse_args(&["--witness-endpoint", "http://w2"]);
+        assert_eq!(witness_endpoint_chain(&failover_pair), vec!["http://w", "http://w2"]);
+
+        // Generator-only: --witness-endpoint becomes optional, chain is the lone generator.
+        let gen_only = Args::try_parse_from([
+            "debug-trace-server",
+            "--rpc-endpoint",
+            "http://r",
+            "--witness-generator-endpoint",
+            "http://gen",
+        ])
+        .unwrap();
+        assert_eq!(witness_endpoint_chain(&gen_only), vec!["http://gen"]);
+        // Neither witness flag: still rejected.
+        assert!(
+            Args::try_parse_from(["debug-trace-server", "--rpc-endpoint", "http://r"]).is_err()
+        );
+
+        // The generator duplicated in the fallback list is a rejected misconfiguration —
+        // it would put the generator back into the historical route's rotation.
+        let dup = parse_args(&["--witness-generator-endpoint", "http://w"]);
+        assert!(validate_args(&dup).is_err());
+        assert!(validate_args(&typed).is_ok());
+
+        // Env var parity with the CLI flag.
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_WITNESS_GENERATOR_ENDPOINT",
+            "http://gen-env",
+            || parse_args(&[]),
+        );
+        assert_eq!(from_env.witness_generator_endpoint.as_deref(), Some("http://gen-env"));
+    }
+
+    /// `--tip-buffer` must stay below `--blocks-to-keep` when chain sync is enabled: the
+    /// pipeline's built-in lag would otherwise satisfy the stale-reset test on every
+    /// transient restart. Inert in stateless mode, where neither flag is used.
+    #[test]
+    fn tip_buffer_must_stay_below_blocks_to_keep() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        // Stateless mode (no data dir): both flags are inert, any combination is accepted.
+        assert!(validate_args(&parse_args(&["--tip-buffer", "2000"])).is_ok());
+
+        let with_db = |extra: &[&str]| {
+            let mut v = vec!["--data-dir", "/tmp/x"];
+            v.extend_from_slice(extra);
+            parse_args(&v)
+        };
+        assert!(validate_args(&with_db(&[])).is_ok());
+        assert!(validate_args(&with_db(&["--tip-buffer", "999"])).is_ok());
+        assert!(validate_args(&with_db(&["--tip-buffer", "1000"])).is_err());
+        assert!(validate_args(&with_db(&["--tip-buffer", "5", "--blocks-to-keep", "5"])).is_err());
     }
 
     /// Verifies a concurrency cap flag parses via CLI and env var, and defaults to `None`.
