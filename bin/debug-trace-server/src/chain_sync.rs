@@ -201,7 +201,7 @@ mod tests {
     use alloy_primitives::B256;
 
     use super::*;
-    use crate::server_db::test_support::{StaticHashStore, make_block_meta};
+    use crate::server_db::test_support::{StubBlockStore, make_block_meta};
 
     fn test_memo() -> CanonicalHashMemo {
         CanonicalHashMemo::new(16)
@@ -213,7 +213,7 @@ mod tests {
     fn stale_reset_clears_canonical_hash_memo() {
         let memo = test_memo();
         memo.insert(42, B256::from([1u8; 32]));
-        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None, memo.clone());
+        let hooks = TraceHooks::new(Arc::new(StubBlockStore::default()), None, memo.clone());
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
         assert!(memo.get(&42).is_none());
     }
@@ -225,7 +225,7 @@ mod tests {
     fn reorg_depth_reaches_the_memo() {
         let memo = test_memo();
         memo.insert(42, B256::from([1u8; 32]));
-        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None, memo.clone());
+        let hooks = TraceHooks::new(Arc::new(StubBlockStore::default()), None, memo.clone());
 
         hooks.on_reorg(10, 1, &[Default::default()]).unwrap();
         assert!(memo.get(&42).is_some(), "a shallow reorg must not clear the memo");
@@ -255,7 +255,7 @@ mod tests {
         }
 
         let hooks =
-            TraceHooks::new(Arc::new(StaticHashStore(None)), Some(cache.clone()), test_memo());
+            TraceHooks::new(Arc::new(StubBlockStore::default()), Some(cache.clone()), test_memo());
         hooks.on_reorg(10, 1, &[h1]).unwrap();
 
         assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());

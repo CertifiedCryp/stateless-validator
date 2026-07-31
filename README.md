@@ -118,6 +118,13 @@ The memo holds `--canonical-hash-memo-capacity` entries (default 8M, roughly 80 
 Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
 Because redb files never shrink on their own, a file that crosses `--db-max-size` ratchets body retention down to that floor and keeps it there until `--db-max-size` is raised or the database is rebuilt.
 
+**Block-data cache:**
+A bounded in-memory `BlockData` cache keyed by block hash sits between the response cache and the local DB / RPC tiers, so requests that miss the response cache — other tracer variants of a block, and especially `debug_traceTransaction` calls for different transactions of the same block, which are never response-cached — reuse one witness fetch and contract resolution.
+Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here; when a trace fails for a data-attributable reason (the witness cannot replay the block), the entry is dropped so the next request refetches instead of replaying the poisoned data, and each such eviction is counted (`block_data_evictions_total`).
+Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the cache uses a fixed 4 shards, so the largest cacheable entry is `max_bytes / 4` on every host (~256 MB at the default), and an insert the cache does not retain is counted (`cache_admission_rejects_total`) and logged rather than masquerading as a miss.
+The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
+Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap; size hosts (or lower the knobs) accordingly.
+
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
 In local cache mode with a generator plus at least one fallback, requests for blocks at least `--witness-local-window` blocks below the local tip skip the generator and fetch from the fallbacks, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
@@ -252,6 +259,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                                              |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                                         |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                                           |
+| `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                                                     |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait, backed by `stateless-db`                             |
 
 ### Database

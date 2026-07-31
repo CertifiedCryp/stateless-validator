@@ -291,13 +291,24 @@ impl BlockStore for ServerDB {
 /// `data_provider`, `chain_sync`, and `main` test modules.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
-    /// No-op [`BlockStore`] stub whose canonical window answers `get_block_hash` with a
-    /// fixed value; everything else is empty.
-    pub(crate) struct StaticHashStore(pub Option<BlockHash>);
+    /// [`BlockStore`] stub: `canonical_hash` answers the canonical window, `canonical_tip`
+    /// the tip height (as a [`make_block_meta`] meta), and `block_data` serves
+    /// `get_block_and_witness` (`None` = missing); writes are no-ops. The read counters
+    /// let tests assert which tier served a request.
+    #[derive(Default)]
+    pub(crate) struct StubBlockStore {
+        pub canonical_hash: Option<BlockHash>,
+        pub canonical_tip: Option<u64>,
+        pub block_data: Option<(Block<Transaction>, LightWitness)>,
+        pub block_reads: AtomicUsize,
+        pub tip_reads: AtomicUsize,
+    }
 
-    impl ContractStore for StaticHashStore {
+    impl ContractStore for StubBlockStore {
         fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
             Ok((HashMap::default(), vec![]))
         }
@@ -306,9 +317,10 @@ pub(crate) mod test_support {
         }
     }
 
-    impl ChainStore for StaticHashStore {
+    impl ChainStore for StubBlockStore {
         fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-            Ok(None)
+            self.tip_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.canonical_tip.map(make_block_meta))
         }
         fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
             Ok(None)
@@ -317,7 +329,7 @@ pub(crate) mod test_support {
             Ok(())
         }
         fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(self.0)
+            Ok(self.canonical_hash)
         }
         fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
             Ok(())
@@ -327,16 +339,16 @@ pub(crate) mod test_support {
         }
     }
 
-    impl DivergenceLookups for StaticHashStore {
+    impl DivergenceLookups for StubBlockStore {
         fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(self.0)
+            Ok(self.canonical_hash)
         }
         fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
             Ok(None)
         }
     }
 
-    impl BlockStore for StaticHashStore {
+    impl BlockStore for StubBlockStore {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
@@ -344,7 +356,10 @@ pub(crate) mod test_support {
             &self,
             block_hash: BlockHash,
         ) -> StoreResult<(Block<Transaction>, LightWitness)> {
-            Err(StoreError::MissingData { kind: MissingDataKind::Block, block_hash })
+            self.block_reads.fetch_add(1, Ordering::Relaxed);
+            self.block_data
+                .clone()
+                .ok_or(StoreError::MissingData { kind: MissingDataKind::Block, block_hash })
         }
     }
 

@@ -52,8 +52,9 @@ use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
+    block_data_cache::BlockDataCache,
     metrics::{
-        ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
+        CacheStats, ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
         record_canonical_hash_resolution,
     },
     server_db::BlockStore,
@@ -297,8 +298,9 @@ impl Drop for InFlightGuard<'_> {
 /// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
-/// 1. Check local database (if configured)
-/// 2. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
+/// 1. Check the in-memory block-data cache (if enabled)
+/// 2. Check local database (if configured)
+/// 3. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
@@ -308,6 +310,15 @@ pub(crate) struct DataProvider {
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).
     db: Option<Arc<dyn BlockStore>>,
+    /// Optional bounded in-memory cache of resolved block data, keyed by block hash.
+    /// Fronts both the DB tier (repeated redb reads + witness decodes) and the RPC tier;
+    /// its main beneficiaries are transaction-level requests, which are never
+    /// response-cached and cluster on shared blocks.
+    block_data_cache: Option<Arc<BlockDataCache>>,
+    /// Tip height memoized by the last DB-backed [`Self::record_block_distance`], so the
+    /// memory-tier hit path records its block distance without opening a redb read.
+    /// `u64::MAX` = no tip observed yet.
+    last_seen_db_tip: AtomicU64,
     /// In-memory contract bytecode cache backed by either `ServerDB` (local-cache mode)
     /// or [`NoopContractStore`] (stateless mode).
     /// Every contract read and every RPC-fetched contract goes through here, so
@@ -394,6 +405,7 @@ impl DataProvider {
     /// # Arguments
     /// * `rpc_client` - RPC client for upstream data fetching
     /// * `db` - Optional local database for cached block data
+    /// * `block_data_cache` - Optional in-memory cache of resolved block data
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
     /// * `witness_cfg` - Witness-source routing window (by block age) and per-stage budgets
@@ -403,6 +415,7 @@ impl DataProvider {
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
+        block_data_cache: Option<Arc<BlockDataCache>>,
         contract_cache: Arc<ContractCache>,
         witness_cfg: WitnessFetchConfig,
         block_fetch_timeout: Duration,
@@ -411,6 +424,8 @@ impl DataProvider {
         Self {
             rpc_client,
             db,
+            block_data_cache,
+            last_seen_db_tip: AtomicU64::new(u64::MAX),
             contract_cache,
             witness_cfg,
             block_fetch_timeout,
@@ -419,6 +434,19 @@ impl DataProvider {
             tip_hint: AtomicU64::new(0),
             tip_seed_next: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Returns block-data cache statistics, or `None` when the cache is disabled.
+    pub fn block_data_cache_stats(&self) -> Option<CacheStats> {
+        self.block_data_cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// Drops a block from the memory cache after its data failed execution: a decodable but
+    /// incomplete witness would otherwise stay pinned, failing every retry until eviction —
+    /// dropping it lets the next request refetch from the endpoints. Returns whether an
+    /// entry was actually removed, so the caller can count real evictions.
+    pub fn evict_block_data(&self, block_hash: &B256) -> bool {
+        self.block_data_cache.as_ref().is_some_and(|cache| cache.remove(block_hash))
     }
 
     /// Clonable handle to the canonical-hash memo, for the chain-sync invalidation hooks.
@@ -574,7 +602,22 @@ impl DataProvider {
     ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
 
-        // Try the local DB first. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
+        // Memory tier: a hit skips the DB read + witness decode entirely.
+        if let Some(cache) = &self.block_data_cache &&
+            let Some(data) = cache.get(&block_hash)
+        {
+            trace!(
+                block_hash = %block_hash,
+                source = "memory",
+                "Block data retrieved from memory cache"
+            );
+            DataSourceMetrics::new_for_source("memory").record();
+            SingleFlightMetrics::new_for_type("bypassed").record();
+            self.record_block_distance_cached(data.block.header.number);
+            return Ok(data);
+        }
+
+        // Try the local DB next. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
         // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
         // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
         if let Some(db) = &self.db &&
@@ -590,7 +633,11 @@ impl DataProvider {
             DataSourceMetrics::new_for_source("db").record();
             SingleFlightMetrics::new_for_type("bypassed").record();
             self.record_block_distance(data.block.header.number);
-            return Ok(Arc::new(data));
+            let data = Arc::new(data);
+            if let Some(cache) = &self.block_data_cache {
+                cache.insert(block_hash, Arc::clone(&data));
+            }
+            return Ok(data);
         }
 
         // Fall back to RPC
@@ -680,11 +727,25 @@ impl DataProvider {
         }
     }
 
-    /// Records the distance of a requested block from the local chain tip.
+    /// Records the distance of a requested block from the local chain tip, memoizing the
+    /// tip for [`Self::record_block_distance_cached`].
     fn record_block_distance(&self, block_number: u64) {
         if let Some(tip) = db_tip_height(self.db.as_deref()) {
+            self.last_seen_db_tip.store(tip, Ordering::Relaxed);
             let distance = tip.saturating_sub(block_number);
             ChainSyncMetrics::create().record_block_distance(distance);
+        }
+    }
+
+    /// [`Self::record_block_distance`] against the memoized tip, for the memory-tier hit
+    /// path: a pure cache hit must not open a redb read just for this histogram. The memo
+    /// can lag the real tip by the blocks synced since the last DB-backed serve, which is
+    /// immaterial for a distance distribution; with no tip observed yet (stateless mode, or
+    /// no DB-backed serve so far) nothing is recorded, matching the DB-backed variant.
+    fn record_block_distance_cached(&self, block_number: u64) {
+        let tip = self.last_seen_db_tip.load(Ordering::Relaxed);
+        if tip != u64::MAX {
+            ChainSyncMetrics::create().record_block_distance(tip.saturating_sub(block_number));
         }
     }
 
@@ -783,8 +844,9 @@ impl DataProvider {
                 let db = self.db.clone();
                 let contract_cache = Arc::clone(&self.contract_cache);
                 let witness_cfg = self.witness_cfg;
+                let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
-                    do_fetch_block_data(
+                    let data = do_fetch_block_data(
                         rpc_client,
                         db,
                         contract_cache,
@@ -794,7 +856,14 @@ impl DataProvider {
                     )
                     .await
                     .map(Arc::new)
-                    .map_err(Arc::new)
+                    .map_err(Arc::new)?;
+                    // Inserting inside the shared future gives exactly one insert per fetch
+                    // and still runs when the primary caller is cancelled while a coalesced
+                    // waiter drives the future to completion.
+                    if let Some(cache) = &block_data_cache {
+                        cache.insert(block_hash, Arc::clone(&data));
+                    }
+                    Ok(data)
                 });
                 let shared = fut.shared();
                 vacant.insert(shared.clone());
@@ -1135,6 +1204,42 @@ impl ContractStore for NoopContractStore {
     }
 }
 
+/// Test fixtures shared with the `rpc_service`, `block_data_cache`, and
+/// `tracing_executor` unit tests; the [`BlockStore`] stub lives in
+/// `server_db::test_support`, next to the trait.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use stateless_test_utils::fixtures::TestFixtures;
+
+    use super::*;
+
+    /// URL of a bound-but-never-answering listener, leaked so connects hang (instead of
+    /// failing fast) for the process lifetime.
+    pub(crate) fn hanging_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::mem::forget(listener);
+        url
+    }
+
+    /// An empty contract cache over the no-op store.
+    pub(crate) fn noop_contract_cache() -> Arc<ContractCache> {
+        Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>))
+    }
+
+    /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
+    /// the synthetic fixture set.
+    pub(crate) fn fixture_block_data() -> BlockData {
+        let fixtures = TestFixtures::synthetic();
+        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let block = fixtures.blocks[&hash].clone();
+        let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+        let contracts: HashMap<B256, Bytecode> =
+            fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
+        BlockData { block, witness, contracts }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1145,7 +1250,7 @@ mod tests {
     use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
     use stateless_common::{BackoffPolicy, RpcClientConfig};
 
-    use crate::server_db::test_support::StaticHashStore;
+    use crate::server_db::test_support::StubBlockStore;
 
     /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
     /// of the inner header, so `verify_hash = true` fetches accept it.
@@ -1265,10 +1370,34 @@ mod tests {
         (rpc_client, cfg)
     }
 
-    /// Provider over `url` with an arbitrary optional [`BlockStore`], a fast-fail retry
-    /// config (150 ms attempts, millisecond backoff), and a 1 s fetch budget so hang tests
-    /// stay fast.
-    fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
+    /// Builds a fixture `(block, witness)` pair plus a contract cache pre-loaded with every
+    /// code hash the witness references, so DB-served fetches never fall through to RPC.
+    fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
+        let BlockData { block, witness, contracts } = test_support::fixture_block_data();
+        let contract_cache = test_support::noop_contract_cache();
+        let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
+            .into_iter()
+            .map(|h| {
+                let code = contracts
+                    .get(&h)
+                    .cloned()
+                    .unwrap_or_else(|| Bytecode::new_raw(vec![0u8].into()));
+                (h, code)
+            })
+            .collect();
+        contract_cache.insert(&codes).unwrap();
+        (block, witness, contract_cache)
+    }
+
+    /// Provider over `url` with optional DB / memory-cache tiers and a caller-supplied
+    /// contract cache, using a fast-fail retry config (150 ms attempts, millisecond
+    /// backoff) and a 1 s fetch budget so hang tests stay fast.
+    fn provider_with_tiers(
+        url: &str,
+        db: Option<Arc<dyn BlockStore>>,
+        block_data_cache: Option<Arc<BlockDataCache>>,
+        contract_cache: Arc<ContractCache>,
+    ) -> DataProvider {
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             per_attempt_timeout: Duration::from_millis(150),
@@ -1276,11 +1405,10 @@ mod tests {
         };
         let rpc_client =
             Arc::new(RpcClient::new_with_config(&[url], &[url], config, None).unwrap());
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         DataProvider::new(
             rpc_client,
             db,
+            block_data_cache,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
@@ -1288,10 +1416,98 @@ mod tests {
         )
     }
 
-    /// [`provider_with`] over a [`StaticHashStore`] whose canonical window answers with
+    /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract
+    /// cache.
+    fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
+        provider_with_tiers(url, db, None, test_support::noop_contract_cache())
+    }
+
+    /// A DB-served block populates the memory cache: the second request for the same hash is
+    /// served from memory — no DB block read, and no fresh tip read for the block-distance
+    /// histogram — and shares the same allocation.
+    #[tokio::test]
+    async fn db_hit_populates_memory_cache_and_second_read_skips_db() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store = Arc::new(StubBlockStore {
+            canonical_tip: Some(block.header.number),
+            block_data: Some((block, witness)),
+            ..Default::default()
+        });
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            Some(Arc::clone(&cache)),
+            contract_cache,
+        );
+
+        let first = provider.get_block_data_by_hash(hash).await.expect("db-served fetch");
+        let second = provider.get_block_data_by_hash(hash).await.expect("memory-served fetch");
+
+        assert_eq!(
+            store.block_reads.load(Ordering::Relaxed),
+            1,
+            "second read must come from memory"
+        );
+        assert!(Arc::ptr_eq(&first, &second), "memory hits share the same allocation");
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(
+            store.tip_reads.load(Ordering::Relaxed),
+            1,
+            "the memory hit must record its distance from the memoized tip, not a DB read"
+        );
+    }
+
+    /// A pre-seeded memory entry is served before DB and RPC: with a hanging upstream and no
+    /// DB, the request must return instantly instead of burning the block-fetch deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_hit_short_circuits_before_db_and_rpc() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
+        let provider =
+            provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
+
+        let start = std::time::Instant::now();
+        let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "memory hit must not reach the hanging upstream"
+        );
+        assert_eq!(data.block.header.hash, hash);
+    }
+
+    /// With the memory cache disabled, every request re-reads the DB.
+    #[tokio::test]
+    async fn disabled_block_data_cache_reads_db_each_time() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            None,
+            contract_cache,
+        );
+
+        provider.get_block_data_by_hash(hash).await.expect("first db read");
+        provider.get_block_data_by_hash(hash).await.expect("second db read");
+        assert_eq!(store.block_reads.load(Ordering::Relaxed), 2);
+    }
+
+    /// [`provider_with`] over a [`StubBlockStore`] whose canonical window answers with
     /// the given fixed hash.
     fn provider_at(url: &str, db: Option<Option<B256>>) -> DataProvider {
-        provider_with(url, db.map(|hash| Arc::new(StaticHashStore(hash)) as Arc<dyn BlockStore>))
+        provider_with(
+            url,
+            db.map(|hash| {
+                Arc::new(StubBlockStore { canonical_hash: hash, ..Default::default() })
+                    as Arc<dyn BlockStore>
+            }),
+        )
     }
 
     /// The local canonical index answers first: a DB hit never consults the upstream —
@@ -1641,13 +1857,12 @@ mod tests {
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
                 .unwrap(),
         );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         // Generous deadline so the task is cancelled *by us*, not by the deadline firing.
         let provider = Arc::new(DataProvider::new(
             rpc_client,
             None,
-            contract_cache,
+            None,
+            test_support::noop_contract_cache(),
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(60),
             1024,
