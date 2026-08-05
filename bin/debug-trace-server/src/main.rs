@@ -65,9 +65,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 mod block_data_cache;
+mod body_metrics;
 mod chain_sync;
+mod compression;
 mod data_provider;
 mod metrics;
+mod middleware;
 mod raw_json;
 mod response_cache;
 mod response_size;
@@ -181,6 +184,12 @@ struct Args {
     /// Disable the HTTP response cache entirely (every trace response is recomputed).
     #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED")]
     response_cache_disabled: bool,
+
+    /// Disable gzip/zstd response compression (normally negotiated per request via the
+    /// client's `Accept-Encoding` header; clients that do not opt in always get
+    /// identity bodies either way).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED")]
+    response_compression_disabled: bool,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -426,6 +435,7 @@ async fn main() -> Result<()> {
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
+        response_compression_disabled = args.response_compression_disabled,
         "Server configuration"
     );
 
@@ -622,11 +632,7 @@ async fn main() -> Result<()> {
     let config = ServerConfig::builder().max_response_body_size(u32::MAX).build();
     let server = Server::builder()
         .set_config(config)
-        .set_http_middleware(
-            tower::ServiceBuilder::new()
-                .layer(response_size::ResponseSizeLayer)
-                .layer(timing::TimingHeaderLayer),
-        )
+        .set_http_middleware(middleware::http_middleware(!args.response_compression_disabled))
         .build(&args.addr)
         .await?;
     let addr = server.local_addr()?;
@@ -1115,6 +1121,23 @@ mod tests {
             "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED",
             "true",
             || parse_args(&[]).response_cache_disabled,
+        );
+        assert!(disabled_via_env);
+    }
+
+    /// Compression kill switch: compression defaults on, disable via CLI or env.
+    #[test]
+    fn response_compression_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert!(!parse_args(&[]).response_compression_disabled);
+        assert!(parse_args(&["--response-compression-disabled"]).response_compression_disabled);
+
+        let disabled_via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED",
+            "true",
+            || parse_args(&[]).response_compression_disabled,
         );
         assert!(disabled_via_env);
     }

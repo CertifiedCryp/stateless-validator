@@ -171,6 +171,33 @@ impl CpuTimeMetrics {
     }
 }
 
+/// Body-streaming telemetry, labeled by negotiated content encoding.
+///
+/// Covers the phase [`CpuTimeMetrics`] cannot see: the request-scoped CPU measurement
+/// is finalized before the first body frame is polled, while compression runs inside
+/// body polling — so its CPU and the actual wire bytes are only observable there.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BodyMetrics {
+    /// Thread CPU seconds spent streaming one response body (compression + frame copies)
+    body_cpu_time_seconds: Histogram,
+    /// Bytes put on the wire (post-compression)
+    wire_bytes_total: Counter,
+}
+
+impl BodyMetrics {
+    /// Creates body metrics for one negotiated encoding (`"identity"` when none).
+    pub fn create(encoding: &'static str) -> Self {
+        Self::new_with_labels(&[("encoding", encoding)])
+    }
+
+    /// Records one finished (or aborted) response body.
+    pub fn record(&self, cpu_seconds: f64, wire_bytes: u64) {
+        self.body_cpu_time_seconds.record(cpu_seconds);
+        self.wire_bytes_total.increment(wire_bytes);
+    }
+}
+
 /// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -519,6 +546,12 @@ fn pre_register_all_metrics() {
     // Request Layer: CPU time (global)
     let _ = CpuTimeMetrics::create();
 
+    // Request Layer: body streaming (per negotiated encoding); br/deflate are
+    // deliberately not offered, so only these three series can ever be written
+    for encoding in ["identity", "gzip", "zstd"] {
+        let _ = BodyMetrics::create(encoding);
+    }
+
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
@@ -599,12 +632,19 @@ const TX_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0
 /// Block distance from chain tip (~ 0–1000 blocks).
 const BLOCK_DISTANCE_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0];
 
+/// Body-streaming CPU per response, seconds (~ sub-ms identity frames to hundreds of ms
+/// compressing a multi-MB trace). Explicit buckets keep this an aggregatable histogram —
+/// without them the exporter renders per-instance summary quantiles, which cannot be
+/// combined across replicas or alerted on cleanly.
+const BODY_CPU_TIME_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
     ("debug_trace_block_distance_from_tip", BLOCK_DISTANCE_BUCKETS),
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
+    ("debug_trace_body_cpu_time_seconds", BODY_CPU_TIME_BUCKETS),
 ];
 
 /// Initializes the Prometheus metrics exporter.
