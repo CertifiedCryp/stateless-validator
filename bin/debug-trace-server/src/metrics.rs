@@ -198,6 +198,26 @@ impl BodyMetrics {
     }
 }
 
+/// Inbound JSON-RPC batch shape, recorded by the concurrent-batch RPC middleware.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BatchMetrics {
+    /// Entries per inbound JSON-RPC batch request
+    batch_size: Histogram,
+}
+
+impl BatchMetrics {
+    /// Creates the global batch-shape metrics.
+    pub fn create() -> Self {
+        Self::new_with_labels(&[] as &[(&str, &str)])
+    }
+
+    /// Records one inbound batch's entry count.
+    pub fn record(&self, entries: usize) {
+        self.batch_size.record(entries as f64);
+    }
+}
+
 /// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -577,6 +597,9 @@ fn pre_register_all_metrics() {
     // Request Layer: CPU time (global)
     let _ = CpuTimeMetrics::create();
 
+    // Request Layer: inbound batch shape (global)
+    let _ = BatchMetrics::create();
+
     // Request Layer: body streaming (per negotiated encoding); br/deflate are
     // deliberately not offered, so only these three series can ever be written
     for encoding in ["identity", "gzip", "zstd"] {
@@ -681,6 +704,7 @@ const BODY_CPU_TIME_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
+    ("debug_trace_batch_size", TX_COUNT_BUCKETS),
     ("debug_trace_block_distance_from_tip", BLOCK_DISTANCE_BUCKETS),
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
