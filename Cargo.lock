@@ -1913,6 +1913,7 @@ dependencies = [
  "metrics",
  "metrics-derive",
  "metrics-exporter-prometheus",
+ "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",
  "pin-project-lite",
